@@ -1,0 +1,143 @@
+{
+  "task": "001_train_elvsr_refine_flow_bi_reds_14frames",
+  "model": "elvsr",
+  "gpu_ids": [
+    0
+  ],
+  "dist": "True",
+  "find_unused_parameters": false,
+  "use_static_graph": true,
+  "scale": 4,
+  "n_channels": 3,
+  "path": {
+    "root": "/home/vherfeld/storage/vherfeld/KAIR_experiments",
+    "pretrained_netG": null,
+    "pretrained_netE": null,
+    "task": "/home/vherfeld/storage/vherfeld/KAIR_experiments/001_train_elvsr_refine_flow_bi_reds_14frames",
+    "log": "/home/vherfeld/storage/vherfeld/KAIR_experiments/001_train_elvsr_refine_flow_bi_reds_14frames/log",
+    "options": "/home/vherfeld/storage/vherfeld/KAIR_experiments/001_train_elvsr_refine_flow_bi_reds_14frames/options",
+    "models": "/home/vherfeld/storage/vherfeld/KAIR_experiments/001_train_elvsr_refine_flow_bi_reds_14frames/models",
+    "images": "/home/vherfeld/storage/vherfeld/KAIR_experiments/001_train_elvsr_refine_flow_bi_reds_14frames/images",
+    "pretrained_optimizerG": null
+  },
+  "datasets": {
+    "train": {
+      "name": "train_dataset",
+      "dataset_type": "VideoRecurrentTrainDataset",
+      "dataroot_gt": "/home/vherfeld/storage/vherfeld/datasets/REDS/train_sharp_with_val.lmdb",
+      "dataroot_lq": "/home/vherfeld/storage/vherfeld/datasets/REDS/train_sharp_bicubic_with_val.lmdb",
+      "meta_info_file": "data/meta_info/meta_info_REDS_GT.txt",
+      "filename_tmpl": "08d",
+      "filename_ext": "png",
+      "val_partition": "REDS4",
+      "test_mode": false,
+      "io_backend": {
+        "type": "lmdb"
+      },
+      "num_frame": 14,
+      "gt_size": 256,
+      "interval_list": [
+        1
+      ],
+      "random_reverse": false,
+      "use_hflip": true,
+      "use_rot": true,
+      "dataloader_shuffle": true,
+      "dataloader_num_workers": 8,
+      "dataloader_batch_size": 8,
+      "phase": "train",
+      "scale": 4,
+      "n_channels": 3
+    },
+    "test": {
+      "name": "test_dataset",
+      "dataset_type": "VideoRecurrentTestDataset",
+      "dataroot_gt": "/home/vherfeld/storage/vherfeld/datasets/REDS_dataset/REDS4/hr",
+      "dataroot_lq": "/home/vherfeld/storage/vherfeld/datasets/REDS_dataset/REDS4/lr",
+      "cache_data": true,
+      "io_backend": {
+        "type": "disk"
+      },
+      "num_frame": -1,
+      "phase": "test",
+      "scale": 4,
+      "n_channels": 3
+    }
+  },
+  "netG": {
+    "net_type": "elvsr",
+    "window_size": 3,
+    "sf": 4,
+    "prior_mode": "recurrent_no_tnr_raw",
+    "unrolled_iters": 1,
+    "alignment_mode": "spynet",
+    "photometric_threshold": 0.5,
+    "fusion_mode": "simple_fusion",
+    "refine_flows": true,
+    "fill_splat_holes": true,
+    "anti_ghost_mode": "sigmoid_w_handcrafted",
+    "residual_prior": true,
+    "pass_normalization_weights": false,
+    "focus_fill": true,
+    "features": 32,
+    "encode_frames": true,
+    "encode_with_unet": true,
+    "feature_anti_ghost": true,
+    "prior_arch": "resunet",
+    "init_type": "default"
+  },
+  "train": {
+    "G_lossfn_type": "charbonnier",
+    "G_lossfn_weight": 1.0,
+    "G_charbonnier_eps": 1e-09,
+    "E_decay": 0,
+    "G_optimizer_type": "adam",
+    "G_optimizer_lr": 0.0004,
+    "G_optimizer_betas": [
+      0.9,
+      0.99
+    ],
+    "G_optimizer_wd": 0,
+    "G_optimizer_clipgrad": null,
+    "G_optimizer_reuse": true,
+    "fix_iter": 10000,
+    "fix_lr_mul": 0.25,
+    "fix_keys": [
+      "optical_flow_model"
+    ],
+    "total_iter": 300000,
+    "G_scheduler_type": "CosineAnnealingWarmRestarts",
+    "G_scheduler_periods": 300000,
+    "G_scheduler_eta_min": 1e-07,
+    "G_regularizer_orthstep": null,
+    "G_regularizer_clipstep": null,
+    "G_param_strict": true,
+    "E_param_strict": true,
+    "checkpoint_test": 5000,
+    "checkpoint_save": 5000,
+    "checkpoint_print": 200,
+    "F_feature_layer": 34,
+    "F_weights": 1.0,
+    "F_lossfn_type": "l1",
+    "F_use_input_norm": true,
+    "F_use_range_norm": false,
+    "G_scheduler_restart_weights": 1
+  },
+  "val": {
+    "save_img": false,
+    "pad_seq": false,
+    "flip_seq": false,
+    "center_frame_only": false,
+    "num_frame_testing": 0,
+    "num_frame_overlapping": 2,
+    "size_patch_testing": 128,
+    "window_size": [6,8,8]
+  },
+  "opt_path": "/home/vherfeld/Research/KAIR/options/elvsr/flow_refine_v1.json",
+  "is_train": true,
+  "merge_bn": false,
+  "merge_bn_startpoint": -1,
+  "num_gpu": 8,
+  "rank": 0,
+  "world_size": 8
+}

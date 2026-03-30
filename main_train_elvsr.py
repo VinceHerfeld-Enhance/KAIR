@@ -24,12 +24,12 @@ import wandb
 
 """
 # --------------------------------------------
-# training code for RVRT / VRT
+# training code for ELVSR
 # --------------------------------------------
 """
 
 
-def main(json_path="/home/vherfeld/Research/KAIR/options/rvrt/001_train_rvrt_videosr_bi_reds_30frames.json"):
+def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json"):
     """
     # ----------------------------------------
     # Step--1 (prepare opt)
@@ -343,12 +343,4 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/rvrt/001_train_rvrt_vid
 
 
 if __name__ == "__main__":
-    parse = argparse.ArgumentParser()
-    parse.add_argument(
-        "--config",
-        type=str,
-        default="/home/vherfeld/Research/KAIR/options/rvrt/001_train_rvrt_videosr_bi_reds_30frames.json",
-        help="Path to option JSON file.",
-    )
-    args = parse.parse_args()
-    main(json_path=args.config)
+    main()

@@ -5,13 +5,15 @@ from utils.utils_bnorm import merge_bn, tidy_sequential
 from torch.nn.parallel import DataParallel, DistributedDataParallel
 
 
-class ModelBase():
+class ModelBase:
     def __init__(self, opt):
-        self.opt = opt                         # opt
-        self.save_dir = opt['path']['models']  # save models
-        self.device = torch.device('cuda' if opt['gpu_ids'] is not None else 'cpu')
-        self.is_train = opt['is_train']        # training or not
-        self.schedulers = []                   # schedulers
+        self.opt = opt  # opt
+        self.save_dir = opt["path"]["models"]  # save models
+        self.device = torch.device("cuda" if opt["gpu_ids"] is not None else "cpu")
+
+        print("Device: {}".format(self.device))
+        self.is_train = opt["is_train"]  # training or not
+        self.schedulers = []  # schedulers
 
     """
     # ----------------------------------------
@@ -95,21 +97,32 @@ class ModelBase():
         return network
 
     def model_to_device(self, network):
-        """Model to device. It also warps models with DistributedDataParallel
-        or DataParallel.
-        Args:
-            network (nn.Module)
-        """
+        """Model to device. Wraps model with DistributedDataParallel (DDP) or DataParallel (DP)."""
         network = network.to(self.device)
-        if self.opt['dist']:
-            find_unused_parameters = self.opt.get('find_unused_parameters', True)
-            use_static_graph = self.opt.get('use_static_graph', False)
-            network = DistributedDataParallel(network, device_ids=[torch.cuda.current_device()], find_unused_parameters=find_unused_parameters)
+
+        if self.opt["dist"]:
+            find_unused_parameters = self.opt.get("find_unused_parameters", True)
+            use_static_graph = self.opt.get("use_static_graph", False)
+
+            # Get the correct GPU for this process
+            local_rank = int(os.environ["LOCAL_RANK"])
+            device = torch.device(f"cuda:{local_rank}")
+            network.to(device)
+
+            network = DistributedDataParallel(
+                network,
+                device_ids=[local_rank],
+                output_device=local_rank,
+                find_unused_parameters=find_unused_parameters,
+            )
+
             if use_static_graph:
                 print('Using static graph. Make sure that "unused parameters" will not change during training loop.')
                 network._set_static_graph()
-        else:
+
+        elif torch.cuda.device_count() > 1:
             network = DataParallel(network)
+
         return network
 
     # ----------------------------------------
@@ -117,10 +130,10 @@ class ModelBase():
     # ----------------------------------------
     def describe_network(self, network):
         network = self.get_bare_model(network)
-        msg = '\n'
-        msg += 'Networks name: {}'.format(network.__class__.__name__) + '\n'
-        msg += 'Params number: {}'.format(sum(map(lambda x: x.numel(), network.parameters()))) + '\n'
-        msg += 'Net structure:\n{}'.format(str(network)) + '\n'
+        msg = "\n"
+        msg += "Networks name: {}".format(network.__class__.__name__) + "\n"
+        msg += "Params number: {}".format(sum(map(lambda x: x.numel(), network.parameters()))) + "\n"
+        msg += "Net structure:\n{}".format(str(network)) + "\n"
         return msg
 
     # ----------------------------------------
@@ -128,12 +141,20 @@ class ModelBase():
     # ----------------------------------------
     def describe_params(self, network):
         network = self.get_bare_model(network)
-        msg = '\n'
-        msg += ' | {:^6s} | {:^6s} | {:^6s} | {:^6s} || {:<20s}'.format('mean', 'min', 'max', 'std', 'shape', 'param_name') + '\n'
+        msg = "\n"
+        msg += (
+            " | {:^6s} | {:^6s} | {:^6s} | {:^6s} || {:<20s}".format("mean", "min", "max", "std", "shape", "param_name")
+            + "\n"
+        )
         for name, param in network.state_dict().items():
-            if not 'num_batches_tracked' in name:
+            if not "num_batches_tracked" in name:
                 v = param.data.clone().float()
-                msg += ' | {:>6.3f} | {:>6.3f} | {:>6.3f} | {:>6.3f} | {} || {:s}'.format(v.mean(), v.min(), v.max(), v.std(), v.shape, name) + '\n'
+                msg += (
+                    " | {:>6.3f} | {:>6.3f} | {:>6.3f} | {:>6.3f} | {} || {:s}".format(
+                        v.mean(), v.min(), v.max(), v.std(), v.shape, name
+                    )
+                    + "\n"
+                )
         return msg
 
     """
@@ -147,7 +168,7 @@ class ModelBase():
     # save the state_dict of the network
     # ----------------------------------------
     def save_network(self, save_dir, network, network_label, iter_label):
-        save_filename = '{}_{}.pth'.format(iter_label, network_label)
+        save_filename = "{}_{}.pth".format(iter_label, network_label)
         save_path = os.path.join(save_dir, save_filename)
         network = self.get_bare_model(network)
         state_dict = network.state_dict()
@@ -158,7 +179,7 @@ class ModelBase():
     # ----------------------------------------
     # load the state_dict of the network
     # ----------------------------------------
-    def load_network(self, load_path, network, strict=True, param_key='params'):
+    def load_network(self, load_path, network, strict=True, param_key="params"):
         network = self.get_bare_model(network)
         if strict:
             state_dict = torch.load(load_path)
@@ -170,7 +191,7 @@ class ModelBase():
             if param_key in state_dict_old.keys():
                 state_dict_old = state_dict_old[param_key]
             state_dict = network.state_dict()
-            for ((key_old, param_old),(key, param)) in zip(state_dict_old.items(), state_dict.items()):
+            for (key_old, param_old), (key, param) in zip(state_dict_old.items(), state_dict.items()):
                 state_dict[key] = param_old
             network.load_state_dict(state_dict, strict=True)
             del state_dict_old, state_dict
@@ -179,7 +200,7 @@ class ModelBase():
     # save the state_dict of the optimizer
     # ----------------------------------------
     def save_optimizer(self, save_dir, optimizer, optimizer_label, iter_label):
-        save_filename = '{}_{}.pth'.format(iter_label, optimizer_label)
+        save_filename = "{}_{}.pth".format(iter_label, optimizer_label)
         save_path = os.path.join(save_dir, save_filename)
         torch.save(optimizer.state_dict(), save_path)
 
@@ -187,14 +208,16 @@ class ModelBase():
     # load the state_dict of the optimizer
     # ----------------------------------------
     def load_optimizer(self, load_path, optimizer):
-        optimizer.load_state_dict(torch.load(load_path, map_location=lambda storage, loc: storage.cuda(torch.cuda.current_device())))
+        optimizer.load_state_dict(
+            torch.load(load_path, map_location=lambda storage, loc: storage.cuda(torch.cuda.current_device()))
+        )
 
     def update_E(self, decay=0.999):
         netG = self.get_bare_model(self.netG)
         netG_params = dict(netG.named_parameters())
         netE_params = dict(self.netE.named_parameters())
         for k in netG_params.keys():
-            netE_params[k].data.mul_(decay).add_(netG_params[k].data, alpha=1-decay)
+            netE_params[k].data.mul_(decay).add_(netG_params[k].data, alpha=1 - decay)
 
     """
     # ----------------------------------------
