@@ -17,6 +17,7 @@ from data.select_dataset import define_Dataset
 import wandb
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs
 
 import os.path
 
@@ -49,7 +50,10 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     # ----------------------------------------
     # Initialize Accelerator (handles DDP automatically)
     # ----------------------------------------
-    accelerator = Accelerator()
+
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
     is_main = accelerator.is_main_process
     rank = accelerator.process_index
