@@ -3,7 +3,7 @@ import math
 import argparse
 import time
 import random
-from KAIR.models.ddp_model_elvsr import DDPModelELVSR
+from models.ddp_model_elvsr import DDPModelELVSR
 import cv2
 import numpy as np
 from collections import OrderedDict
@@ -144,7 +144,7 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                 train_set,
                 batch_size=dataset_opt["dataloader_batch_size"] // world_size,
                 shuffle=dataset_opt["dataloader_shuffle"],
-                num_workers=dataset_opt["dataloader_num_workers"],
+                num_workers=dataset_opt["dataloader_num_workers"] // world_size,
                 drop_last=True,
                 pin_memory=True,
             )

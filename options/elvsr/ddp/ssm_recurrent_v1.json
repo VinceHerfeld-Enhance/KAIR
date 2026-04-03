@@ -2,7 +2,8 @@
   "task": "001_train_elvsr_ssm_multi_bi_reds_14frames",
   "model": "elvsr",
   "gpu_ids": [
-    0
+    0,
+    1
   ],
   "dist": "True",
   "find_unused_parameters": false,
@@ -43,7 +44,7 @@
       "use_hflip": true,
       "use_rot": true,
       "dataloader_shuffle": true,
-      "dataloader_num_workers": 2,
+      "dataloader_num_workers": 8,
       "dataloader_batch_size": 8,
       "phase": "train",
       "scale": 4,
@@ -144,7 +145,7 @@
   "is_train": true,
   "merge_bn": false,
   "merge_bn_startpoint": -1,
-  "num_gpu": 1,
+  "num_gpu": 2,
   "rank": 0,
   "world_size": 8
 }

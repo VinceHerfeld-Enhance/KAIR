@@ -10,22 +10,22 @@
   "scale": 4,
   "n_channels": 3,
   "path": {
-    "root": "/home/vherfeld/storage/vherfeld/KAIR_experiments",
+    "root": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments",
     "pretrained_netG": null,
     "pretrained_netE": null,
-    "task": "/home/vherfeld/storage/vherfeld/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames",
-    "log": "/home/vherfeld/storage/vherfeld/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/log",
-    "options": "/home/vherfeld/storage/vherfeld/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/options",
-    "models": "/home/vherfeld/storage/vherfeld/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/models",
-    "images": "/home/vherfeld/storage/vherfeld/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/images",
+    "task": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames",
+    "log": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/log",
+    "options": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/options",
+    "models": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/models",
+    "images": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/images",
     "pretrained_optimizerG": null
   },
   "datasets": {
     "train": {
       "name": "train_dataset",
       "dataset_type": "VideoRecurrentTrainDataset",
-      "dataroot_gt": "/home/vherfeld/storage/vherfeld/datasets/REDS/train_sharp_with_val.lmdb",
-      "dataroot_lq": "/home/vherfeld/storage/vherfeld/datasets/REDS/train_sharp_bicubic_with_val.lmdb",
+      "dataroot_gt": "/linkhome/rech/gennip01/ura93tx/scratch/datasets/REDS/train_sharp_with_val.lmdb",
+      "dataroot_lq": "/linkhome/rech/gennip01/ura93tx/scratch/datasets/REDS/train_sharp_bicubic_with_val.lmdb",
       "meta_info_file": "data/meta_info/meta_info_REDS_GT.txt",
       "filename_tmpl": "08d",
       "filename_ext": "png",
@@ -43,7 +43,7 @@
       "use_hflip": true,
       "use_rot": true,
       "dataloader_shuffle": true,
-      "dataloader_num_workers": 8,
+      "dataloader_num_workers": 1,
       "dataloader_batch_size": 8,
       "phase": "train",
       "scale": 4,
@@ -52,8 +52,8 @@
     "test": {
       "name": "test_dataset",
       "dataset_type": "VideoRecurrentTestDataset",
-      "dataroot_gt": "/home/vherfeld/storage/vherfeld/datasets/REDS_dataset/REDS4/hr",
-      "dataroot_lq": "/home/vherfeld/storage/vherfeld/datasets/REDS_dataset/REDS4/lr",
+      "dataroot_gt": "/linkhome/rech/gennip01/ura93tx/scratch/datasets/REDS4/hr",
+      "dataroot_lq": "/linkhome/rech/gennip01/ura93tx/scratch/datasets/REDS4/lr",
       "cache_data": true,
       "io_backend": {
         "type": "disk"
@@ -84,7 +84,7 @@
     "encode_with_unet": true,
     "feature_anti_ghost": true,
     "prior_arch": "resunet",
-    "n_flows_per_frame": 2,
+    "n_flows_per_frame": 4,
     "use_multiple_hypothesis_flow": true,
     "init_type": "default"
   },
@@ -135,11 +135,11 @@
     "size_patch_testing": 128,
     "window_size": [6,8,8]
   },
-  "opt_path": "/home/vherfeld/Research/KAIR/options/elvsr/multi_flow_v1.json",
+  "opt_path": "/linkhome/rech/gennip01/ura93tx/Research/KAIR/options/elvsr/multi_flow_v1.json",
   "is_train": true,
   "merge_bn": false,
   "merge_bn_startpoint": -1,
-  "num_gpu": 8,
+  "num_gpu": 1,
   "rank": 0,
   "world_size": 8
 }

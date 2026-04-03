@@ -93,12 +93,16 @@ class DDPModelELVSR(ModelPlain):
         # Handle fix_keys logic (freeze/unfreeze certain parameters)
         if self.fix_iter:
             net = self.get_bare_model(self.netG)
-            if self.fix_unflagged and current_step < self.fix_iter:
-                print(f"Fix keys: {self.fix_keys} for the first {self.fix_iter} iters.")
+            if self.fix_unflagged:
                 self.fix_unflagged = False
-                for name, param in net.named_parameters():
-                    if any([key in name for key in self.fix_keys]):
-                        param.requires_grad_(False)
+                if current_step < self.fix_iter:
+                    print(f"Fix keys: {self.fix_keys} for the first {self.fix_iter} iters.")
+                    for name, param in net.named_parameters():
+                        if any([key in name for key in self.fix_keys]):
+                            param.requires_grad_(False)
+                elif current_step >= self.fix_iter:
+                    print(f"Train all the parameters from {self.fix_iter} iters (resuming training).")
+                    net.requires_grad_(True)
             elif current_step == self.fix_iter:
                 print(f"Train all the parameters from {self.fix_iter} iters.")
                 net.requires_grad_(True)
@@ -107,17 +111,26 @@ class DDPModelELVSR(ModelPlain):
         self.G_optimizer.zero_grad()
         self.netG.train()
         self.E = self.netG(self.L)
-        loss = self.lossfn(self.E, self.H)
+        loss = self.G_lossfn(self.E, self.H)
 
         # Backward via accelerator (handles gradient scaling, sync, etc.)
         if self.accelerator is not None:
             self.accelerator.backward(loss)
         else:
             loss.backward()
+        # After loss.backward() or accelerator.backward(loss)
+        optical_flow_net = model.get_bare_model(model.netG).optical_flow_model  # adjust to your actual attribute
 
+        for name, param in optical_flow_net.named_parameters():
+            if param.requires_grad:
+                if param.grad is None:
+                    print(f"[WARNING] {name} did NOT receive grad!")
+                else:
+                    print(f"{name} grad norm: {param.grad.norm():.4f}")
+        breakpoint()
         # Gradient clipping (if configured)
         G_optimizer_clipgrad = self.opt_train.get("G_optimizer_clipgrad", 0)
-        if G_optimizer_clipgrad > 0:
+        if G_optimizer_clipgrad is not None and G_optimizer_clipgrad > 0:
             if self.accelerator is not None:
                 self.accelerator.clip_grad_norm_(
                     self.get_bare_model(self.netG).parameters(),
@@ -135,15 +148,6 @@ class DDPModelELVSR(ModelPlain):
         self.log_dict["G_loss"] = loss.item()
 
     # ----------------------------------------
-    # log psnr (training PSNR on current batch)
-    # ----------------------------------------
-    def log_psnr(self):
-        with torch.no_grad():
-            self.log_dict["Train_PSNR"] = (
-                10 * torch.log10(1.0 / (self.lossfn(self.E.detach(), self.H.detach()) + 1e-8)).item()
-            )
-
-    # ----------------------------------------
     # current learning rate
     # ----------------------------------------
     def current_learning_rate(self):
@@ -154,10 +158,10 @@ class DDPModelELVSR(ModelPlain):
     # ----------------------------------------
     def current_visuals(self):
         out_dict = OrderedDict()
-        out_dict["L"] = self.L.detach().float().cpu()
-        out_dict["E"] = self.E.detach().float().cpu()
+        out_dict["L"] = self.L.detach()[0].float().cpu()
+        out_dict["E"] = self.E.detach()[0].float().cpu()
         if hasattr(self, "H") and self.H is not None:
-            out_dict["H"] = self.H.detach().float().cpu()
+            out_dict["H"] = self.H.detach()[0].float().cpu()
         return out_dict
 
     # ----------------------------------------

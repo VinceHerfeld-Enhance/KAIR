@@ -1,8 +1,9 @@
 {
-  "task": "001_train_elvsr_ssm_multi_bi_reds_14frames",
+  "task": "001_train_elvsr_multi_flow_bi_reds_14frames",
   "model": "elvsr",
   "gpu_ids": [
-    0
+    0 ,
+    1
   ],
   "dist": "True",
   "find_unused_parameters": false,
@@ -13,11 +14,11 @@
     "root": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments",
     "pretrained_netG": null,
     "pretrained_netE": null,
-    "task": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_flow_bi_reds_14frames",
-    "log": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_flow_bi_reds_14frames/log",
-    "options": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_flow_bi_reds_14frames/options",
-    "models": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_flow_bi_reds_14frames/models",
-    "images": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_flow_bi_reds_14frames/images",
+    "task": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames",
+    "log": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/log",
+    "options": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/options",
+    "models": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/models",
+    "images": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/images",
     "pretrained_optimizerG": null
   },
   "datasets": {
@@ -43,7 +44,7 @@
       "use_hflip": true,
       "use_rot": true,
       "dataloader_shuffle": true,
-      "dataloader_num_workers": 2,
+      "dataloader_num_workers": 8,
       "dataloader_batch_size": 8,
       "phase": "train",
       "scale": 4,
@@ -52,8 +53,8 @@
     "test": {
       "name": "test_dataset",
       "dataset_type": "VideoRecurrentTestDataset",
-      "dataroot_gt": "/linkhome/rech/gennip01/ura93tx/scratch/dataset/REDS4/hr",
-      "dataroot_lq": "/linkhome/rech/gennip01/ura93tx/scratch/dataset/REDS4/lr",
+      "dataroot_gt": "/linkhome/rech/gennip01/ura93tx/scratch/datasets/REDS4/hr",
+      "dataroot_lq": "/linkhome/rech/gennip01/ura93tx/scratch/datasets/REDS4/lr",
       "cache_data": true,
       "io_backend": {
         "type": "disk"
@@ -66,9 +67,9 @@
   },
   "netG": {
     "net_type": "elvsr",
-    "window_size": 4,
+    "window_size": 3,
     "sf": 4,
-    "prior_mode": "raw_recurrent_ssm",
+    "prior_mode": "recurrent_no_tnr_raw",
     "unrolled_iters": 1,
     "alignment_mode": "spynet",
     "photometric_threshold": 0.5,
@@ -84,12 +85,7 @@
     "encode_with_unet": true,
     "feature_anti_ghost": true,
     "prior_arch": "resunet",
-    "state_list": [
-      "up2",
-      "up1"
-    ],
-    "ssm_type": "gru",
-    "n_flows_per_frame": 2,
+    "n_flows_per_frame": 4,
     "use_multiple_hypothesis_flow": true,
     "init_type": "default"
   },
@@ -107,14 +103,14 @@
     "G_optimizer_wd": 0,
     "G_optimizer_clipgrad": null,
     "G_optimizer_reuse": true,
-    "fix_iter": 30000,
+    "fix_iter": 10000,
     "fix_lr_mul": 0.25,
     "fix_keys": [
       "optical_flow_model"
     ],
-    "total_iter": 600000,
+    "total_iter": 300000,
     "G_scheduler_type": "CosineAnnealingWarmRestarts",
-    "G_scheduler_periods": 600000,
+    "G_scheduler_periods": 300000,
     "G_scheduler_eta_min": 1e-07,
     "G_regularizer_orthstep": null,
     "G_regularizer_clipstep": null,
@@ -140,11 +136,11 @@
     "size_patch_testing": 128,
     "window_size": [6,8,8]
   },
-  "opt_path": "/linkhome/rech/gennip01/ura93tx/Research/KAIR/options/elvsr/ssm_recurrent_v1.json",
+  "opt_path": "/linkhome/rech/gennip01/ura93tx/Research/KAIR/options/elvsr/multi_flow_v1.json",
   "is_train": true,
   "merge_bn": false,
   "merge_bn_startpoint": -1,
-  "num_gpu": 1,
+  "num_gpu": 2,
   "rank": 0,
   "world_size": 8
 }

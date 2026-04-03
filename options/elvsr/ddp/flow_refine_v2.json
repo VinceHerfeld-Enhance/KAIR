@@ -1,8 +1,9 @@
 {
-  "task": "001_train_elvsr_ssm_multi_bi_reds_14frames",
+  "task": "002_train_elvsr_refine_flow_bi_reds_14frames",
   "model": "elvsr",
   "gpu_ids": [
-    0
+    0 ,
+    1
   ],
   "dist": "True",
   "find_unused_parameters": false,
@@ -43,7 +44,7 @@
       "use_hflip": true,
       "use_rot": true,
       "dataloader_shuffle": true,
-      "dataloader_num_workers": 2,
+      "dataloader_num_workers": 24,
       "dataloader_batch_size": 8,
       "phase": "train",
       "scale": 4,
@@ -52,8 +53,8 @@
     "test": {
       "name": "test_dataset",
       "dataset_type": "VideoRecurrentTestDataset",
-      "dataroot_gt": "/linkhome/rech/gennip01/ura93tx/scratch/dataset/REDS4/hr",
-      "dataroot_lq": "/linkhome/rech/gennip01/ura93tx/scratch/dataset/REDS4/lr",
+      "dataroot_gt": "/linkhome/rech/gennip01/ura93tx/scratch/datasets/REDS4/hr",
+      "dataroot_lq": "/linkhome/rech/gennip01/ura93tx/scratch/datasets/REDS4/lr",
       "cache_data": true,
       "io_backend": {
         "type": "disk"
@@ -68,7 +69,7 @@
     "net_type": "elvsr",
     "window_size": 4,
     "sf": 4,
-    "prior_mode": "raw_recurrent_ssm",
+    "prior_mode": "recurrent_no_tnr_raw",
     "unrolled_iters": 1,
     "alignment_mode": "spynet",
     "photometric_threshold": 0.5,
@@ -84,13 +85,6 @@
     "encode_with_unet": true,
     "feature_anti_ghost": true,
     "prior_arch": "resunet",
-    "state_list": [
-      "up2",
-      "up1"
-    ],
-    "ssm_type": "gru",
-    "n_flows_per_frame": 2,
-    "use_multiple_hypothesis_flow": true,
     "init_type": "default"
   },
   "train": {
@@ -120,9 +114,9 @@
     "G_regularizer_clipstep": null,
     "G_param_strict": true,
     "E_param_strict": true,
-    "checkpoint_test": 5000,
+    "checkpoint_test": 1,
     "checkpoint_save": 5000,
-    "checkpoint_print": 200,
+    "checkpoint_print": 1,
     "F_feature_layer": 34,
     "F_weights": 1.0,
     "F_lossfn_type": "l1",
@@ -140,11 +134,11 @@
     "size_patch_testing": 128,
     "window_size": [6,8,8]
   },
-  "opt_path": "/linkhome/rech/gennip01/ura93tx/Research/KAIR/options/elvsr/ssm_recurrent_v1.json",
+  "opt_path": "/linkhome/rech/gennip01/ura93tx/Research/KAIR/options/elvsr/flow_refine_v2.json",
   "is_train": true,
   "merge_bn": false,
   "merge_bn_startpoint": -1,
-  "num_gpu": 1,
+  "num_gpu": 2,
   "rank": 0,
-  "world_size": 8
+  "world_size": 2
 }
