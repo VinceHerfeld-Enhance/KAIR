@@ -50,10 +50,7 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     # ----------------------------------------
     # Initialize Accelerator (handles DDP automatically)
     # ----------------------------------------
-
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-
-    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+    accelerator = Accelerator()
     device = accelerator.device
     is_main = accelerator.is_main_process
     rank = accelerator.process_index

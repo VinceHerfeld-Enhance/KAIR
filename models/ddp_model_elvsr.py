@@ -51,8 +51,8 @@ class DDPModelELVSR(ModelPlain):
                     else:
                         normal_params.append(param)
                 G_optim_params = [
-                    {"params": normal_params, "lr": self.opt_train["G_optimizer_lr"]},
-                    {"params": flow_params, "lr": self.opt_train["G_optimizer_lr"] * fix_lr_mul},
+                    {"params": normal_params, "lr": self.opt_train["G_optimizer_lr"], "name": "normal"},
+                    {"params": flow_params, "lr": self.opt_train["G_optimizer_lr"] * fix_lr_mul, "name": "flow"},
                 ]
 
             if self.opt_train["G_optimizer_type"] == "adam":
@@ -92,20 +92,26 @@ class DDPModelELVSR(ModelPlain):
     def optimize_parameters(self, current_step):
         # Handle fix_keys logic (freeze/unfreeze certain parameters)
         if self.fix_iter:
-            net = self.get_bare_model(self.netG)
             if self.fix_unflagged:
                 self.fix_unflagged = False
                 if current_step < self.fix_iter:
-                    print(f"Fix keys: {self.fix_keys} for the first {self.fix_iter} iters.")
-                    for name, param in net.named_parameters():
-                        if any([key in name for key in self.fix_keys]):
-                            param.requires_grad_(False)
+                    print(f"Freezing flow training at {self.fix_iter} (setting lr to 0)")
+
+                    for group in self.G_optimizer.param_groups:
+                        if group.get("name", "normal") == "flow":
+                            group["lr"] = 0
+
                 elif current_step >= self.fix_iter:
-                    print(f"Train all the parameters from {self.fix_iter} iters (resuming training).")
-                    net.requires_grad_(True)
+                    print(f"Unfreezing flow params at {self.fix_iter} (restoring training)")
+                    for group in self.G_optimizer.param_groups:
+                        if group.get("name", "normal") == "flow":
+                            group["lr"] = self.opt_train["G_optimizer_lr"] * self.opt_train["fix_lr_mul"]
+
             elif current_step == self.fix_iter:
-                print(f"Train all the parameters from {self.fix_iter} iters.")
-                net.requires_grad_(True)
+                print(f"Unfreezing flow params at {self.fix_iter} (setting lr > 0).")
+                for group in self.G_optimizer.param_groups:
+                    if group.get("name", "normal") == "flow":
+                        group["lr"] = self.opt_train["G_optimizer_lr"] * self.opt_train["fix_lr_mul"]
 
         # Forward
         self.G_optimizer.zero_grad()
@@ -118,16 +124,7 @@ class DDPModelELVSR(ModelPlain):
             self.accelerator.backward(loss)
         else:
             loss.backward()
-        # After loss.backward() or accelerator.backward(loss)
-        optical_flow_net = model.get_bare_model(model.netG).optical_flow_model  # adjust to your actual attribute
 
-        for name, param in optical_flow_net.named_parameters():
-            if param.requires_grad:
-                if param.grad is None:
-                    print(f"[WARNING] {name} did NOT receive grad!")
-                else:
-                    print(f"{name} grad norm: {param.grad.norm():.4f}")
-        breakpoint()
         # Gradient clipping (if configured)
         G_optimizer_clipgrad = self.opt_train.get("G_optimizer_clipgrad", 0)
         if G_optimizer_clipgrad is not None and G_optimizer_clipgrad > 0:
