@@ -293,7 +293,7 @@ def define_G(opt):
     # ----------------------------------------
     # others
     # ----------------------------------------
-    elif net_type == "elvsr":
+    elif net_type == "elvsr-legacy":
         from vsr.research_models.recurrent_prior import VSRNet
 
         netG = VSRNet(
@@ -319,6 +319,27 @@ def define_G(opt):
             softmax_splatting=opt_net.get("softmax_splatting", False),
             prior_arch=opt_net.get("prior_arch", "resunet"),
             ssm_type=opt_net.get("ssm_type", "gru"),
+        )
+    elif net_type == "elvsr":
+        from vsr.research_models.elvsr import VSRNet
+
+        netG = VSRNet(
+            sf=opt_net.get("sf", 4),
+            prior_mode=opt_net.get("prior_mode", "recurrent"),
+            window_size=opt_net.get("window_size", 3),
+            anti_ghost_mode=opt_net.get("anti_ghost_mode", "sigmoid"),
+            alignment_mode=opt_net.get("alignment_mode", "spynet"),
+            photometric_threshold=opt_net.get("photometric_threshold", 0.5),
+            refine_flows=opt_net.get("refine_flows", False),
+            n_flows_per_frame=opt_net.get("n_flows_per_frame", 1),
+            fill_holes=opt_net.get("fill_splat_holes", True),
+            residual_prior=opt_net.get("residual_prior", False),
+            focus_fill=opt_net.get("focus_fill", False),
+            features=opt_net.get("features", 3),
+            feature_anti_ghost=opt_net.get("feature_anti_ghost", False),
+            state_list=opt_net.get("state_list", ["temp", "up3", "up2", "up1"]),
+            ssm_type=opt_net.get("ssm_type", "gru"),
+            spynet_path=opt_net.get("spynet_path", "pretrained/spynet.pth"),
         )
 
     else:
