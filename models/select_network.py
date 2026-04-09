@@ -331,6 +331,7 @@ def define_G(opt):
             alignment_mode=opt_net.get("alignment_mode", "spynet"),
             photometric_threshold=opt_net.get("photometric_threshold", 0.5),
             refine_flows=opt_net.get("refine_flows", False),
+            refine_features=opt_net.get("refine_features", False),
             n_flows_per_frame=opt_net.get("n_flows_per_frame", 1),
             fill_holes=opt_net.get("fill_splat_holes", True),
             residual_prior=opt_net.get("residual_prior", False),
