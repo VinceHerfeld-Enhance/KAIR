@@ -1,9 +1,8 @@
 {
-  "task": "001_train_elvsr_multi_flow_bi_reds_14frames",
+  "task": "003_train_elvsr_refine_flow_bi_reds_14frames",
   "model": "elvsr",
   "gpu_ids": [
-    0 ,
-    1
+    0
   ],
   "dist": "True",
   "find_unused_parameters": false,
@@ -14,11 +13,11 @@
     "root": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments",
     "pretrained_netG": null,
     "pretrained_netE": null,
-    "task": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames",
-    "log": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/log",
-    "options": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/options",
-    "models": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/models",
-    "images": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_multi_flow_bi_reds_14frames/images",
+    "task": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_flow_bi_reds_14frames",
+    "log": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_flow_bi_reds_14frames/log",
+    "options": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_flow_bi_reds_14frames/options",
+    "models": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_flow_bi_reds_14frames/models",
+    "images": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_flow_bi_reds_14frames/images",
     "pretrained_optimizerG": null
   },
   "datasets": {
@@ -35,7 +34,7 @@
       "io_backend": {
         "type": "lmdb"
       },
-      "num_frame": 14,
+      "num_frame": 9,
       "gt_size": 256,
       "interval_list": [
         1
@@ -44,7 +43,7 @@
       "use_hflip": true,
       "use_rot": true,
       "dataloader_shuffle": true,
-      "dataloader_num_workers": 24,
+      "dataloader_num_workers": 12,
       "dataloader_batch_size": 8,
       "phase": "train",
       "scale": 4,
@@ -85,8 +84,6 @@
     "encode_with_unet": true,
     "feature_anti_ghost": true,
     "prior_arch": "resunet",
-    "n_flows_per_frame": 4,
-    "use_multiple_hypothesis_flow": true,
     "init_type": "default"
   },
   "train": {
@@ -103,14 +100,14 @@
     "G_optimizer_wd": 0,
     "G_optimizer_clipgrad": null,
     "G_optimizer_reuse": true,
-    "fix_iter": 10000,
+    "fix_iter": 30000,
     "fix_lr_mul": 0.25,
     "fix_keys": [
       "optical_flow_model"
     ],
-    "total_iter": 300000,
+    "total_iter": 600000,
     "G_scheduler_type": "CosineAnnealingWarmRestarts",
-    "G_scheduler_periods": 300000,
+    "G_scheduler_periods": 600000,
     "G_scheduler_eta_min": 1e-07,
     "G_regularizer_orthstep": null,
     "G_regularizer_clipstep": null,
@@ -136,11 +133,11 @@
     "size_patch_testing": 128,
     "window_size": [6,8,8]
   },
-  "opt_path": "/linkhome/rech/gennip01/ura93tx/Research/KAIR/options/elvsr/multi_flow_v1.json",
+  "opt_path": "/linkhome/rech/gennip01/ura93tx/Research/KAIR/options/elvsr/flow_refine_v2.json",
   "is_train": true,
   "merge_bn": false,
   "merge_bn_startpoint": -1,
-  "num_gpu": 2,
+  "num_gpu": 1,
   "rank": 0,
-  "world_size": 2
+  "world_size": 1
 }

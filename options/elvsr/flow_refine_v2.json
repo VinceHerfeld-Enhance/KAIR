@@ -43,8 +43,8 @@
       "use_hflip": true,
       "use_rot": true,
       "dataloader_shuffle": true,
-      "dataloader_num_workers": 8,
-      "dataloader_batch_size": 1,
+      "dataloader_num_workers": 12,
+      "dataloader_batch_size": 8,
       "phase": "train",
       "scale": 4,
       "n_channels": 3
@@ -68,8 +68,8 @@
     "net_type": "elvsr",
     "window_size": 4,
     "sf": 4,
-    "prior_mode": "recurrent_no_tnr_raw",
-    "unrolled_iters": 1,
+    "prior_mode": "recurrent",
+    "spynet_path": "/linkhome/rech/gennip01/ura93tx/storage/other_checkpoints/SpyNet/spynet_sintel_final-3d2a1287.pth",
     "alignment_mode": "spynet",
     "photometric_threshold": 0.5,
     "fusion_mode": "simple_fusion",
@@ -77,13 +77,9 @@
     "fill_splat_holes": true,
     "anti_ghost_mode": "sigmoid_w_handcrafted",
     "residual_prior": true,
-    "pass_normalization_weights": false,
     "focus_fill": true,
     "features": 32,
-    "encode_frames": true,
-    "encode_with_unet": true,
     "feature_anti_ghost": true,
-    "prior_arch": "resunet",
     "init_type": "default"
   },
   "train": {
@@ -92,7 +88,7 @@
     "G_charbonnier_eps": 1e-09,
     "E_decay": 0,
     "G_optimizer_type": "adam",
-    "G_optimizer_lr": 0.0004,
+    "G_optimizer_lr": 0.00035,
     "G_optimizer_betas": [
       0.9,
       0.99
@@ -113,9 +109,9 @@
     "G_regularizer_clipstep": null,
     "G_param_strict": true,
     "E_param_strict": true,
-    "checkpoint_test": 1,
+    "checkpoint_test": 5000,
     "checkpoint_save": 5000,
-    "checkpoint_print": 1,
+    "checkpoint_print": 200,
     "F_feature_layer": 34,
     "F_weights": 1.0,
     "F_lossfn_type": "l1",
@@ -139,5 +135,5 @@
   "merge_bn_startpoint": -1,
   "num_gpu": 1,
   "rank": 0,
-  "world_size": 8
+  "world_size": 1
 }

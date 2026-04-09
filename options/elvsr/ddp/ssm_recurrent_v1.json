@@ -44,7 +44,7 @@
       "use_hflip": true,
       "use_rot": true,
       "dataloader_shuffle": true,
-      "dataloader_num_workers": 8,
+      "dataloader_num_workers": 24,
       "dataloader_batch_size": 8,
       "phase": "train",
       "scale": 4,
@@ -53,8 +53,8 @@
     "test": {
       "name": "test_dataset",
       "dataset_type": "VideoRecurrentTestDataset",
-      "dataroot_gt": "/linkhome/rech/gennip01/ura93tx/scratch/dataset/REDS4/hr",
-      "dataroot_lq": "/linkhome/rech/gennip01/ura93tx/scratch/dataset/REDS4/lr",
+      "dataroot_gt": "/linkhome/rech/gennip01/ura93tx/scratch/datasets/REDS4/hr",
+      "dataroot_lq": "/linkhome/rech/gennip01/ura93tx/scratch/datasets/REDS4/lr",
       "cache_data": true,
       "io_backend": {
         "type": "disk"
@@ -69,8 +69,8 @@
     "net_type": "elvsr",
     "window_size": 4,
     "sf": 4,
-    "prior_mode": "raw_recurrent_ssm",
-    "unrolled_iters": 1,
+    "prior_mode": "ssm_recurrent",
+    "spynet_path": "/linkhome/rech/gennip01/ura93tx/storage/other_checkpoints/SpyNet/spynet_sintel_final-3d2a1287.pth",
     "alignment_mode": "spynet",
     "photometric_threshold": 0.5,
     "fusion_mode": "simple_fusion",
@@ -78,20 +78,15 @@
     "fill_splat_holes": true,
     "anti_ghost_mode": "sigmoid_w_handcrafted",
     "residual_prior": true,
-    "pass_normalization_weights": false,
     "focus_fill": true,
     "features": 32,
-    "encode_frames": true,
-    "encode_with_unet": true,
     "feature_anti_ghost": true,
-    "prior_arch": "resunet",
     "state_list": [
       "up2",
       "up1"
     ],
     "ssm_type": "gru",
     "n_flows_per_frame": 2,
-    "use_multiple_hypothesis_flow": true,
     "init_type": "default"
   },
   "train": {
@@ -147,5 +142,5 @@
   "merge_bn_startpoint": -1,
   "num_gpu": 2,
   "rank": 0,
-  "world_size": 8
+  "world_size": 2
 }
