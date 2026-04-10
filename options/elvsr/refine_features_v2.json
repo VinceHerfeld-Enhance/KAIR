@@ -1,5 +1,5 @@
 {
-  "task": "001_train_elvsr_refine_features_bi_reds_14frames",
+  "task": "002_train_elvsr_refine_features_bi_reds_14frames",
   "model": "elvsr",
   "gpu_ids": [
     0
@@ -13,11 +13,11 @@
     "root": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments",
     "pretrained_netG": null,
     "pretrained_netE": null,
-    "task": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_refine_features_bi_reds_14frames",
-    "log": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_refine_features_bi_reds_14frames/log",
-    "options": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_refine_features_bi_reds_14frames/options",
-    "models": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_refine_features_bi_reds_14frames/models",
-    "images": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/001_train_elvsr_refine_features_bi_reds_14frames/images",
+    "task": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_features_bi_reds_14frames",
+    "log": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_features_bi_reds_14frames/log",
+    "options": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_features_bi_reds_14frames/options",
+    "models": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_features_bi_reds_14frames/models",
+    "images": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/002_train_elvsr_refine_features_bi_reds_14frames/images",
     "pretrained_optimizerG": null
   },
   "datasets": {
@@ -79,7 +79,7 @@
     "refine_features": true,
     "focus_fill": true,
     "features": 32,
-    "n_flows_per_frame": 1,
+    "n_flows_per_frame": 2,
     "init_type": "default"
   },
   "train": {
@@ -129,7 +129,7 @@
     "size_patch_testing": 128,
     "window_size": [6,8,8]
   },
-  "opt_path": "/linkhome/rech/gennip01/ura93tx/Research/KAIR/options/elvsr/refine_features_v1.json",
+  "opt_path": "/linkhome/rech/gennip01/ura93tx/Research/KAIR/options/elvsr/refine_features_v2.json",
   "is_train": true,
   "merge_bn": false,
   "merge_bn_startpoint": -1,
