@@ -180,11 +180,13 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
         for i, train_data in enumerate(train_loader):
 
             current_step += 1
+            if current_step > opt["train"]["total_iter"]:
+                break
 
             # -------------------------------
             # 1) update learning rate
             # -------------------------------
-            model.update_learning_rate(current_step)
+            model.update_learning_rate(min(current_step, opt["train"]["total_iter"]))
 
             # -------------------------------
             # 2) feed patch pairs
@@ -218,18 +220,6 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
             if current_step % opt["train"]["checkpoint_save"] == 0 and opt["rank"] == 0:
                 logger.info("Saving the model.")
                 model.save(current_step)
-
-            if opt["use_static_graph"] and (current_step == opt["train"]["fix_iter"] - 1):
-                current_step += 1
-                model.update_learning_rate(current_step)
-                model.save(current_step)
-                current_step -= 1
-                logger.info(
-                    "Saving models ahead of time when changing the computation graph with use_static_graph=True"
-                    " (we need it due to a bug with use_checkpoint=True in distributed training). The training "
-                    "will be terminated by PyTorch in the next iteration. Just resume training with the same "
-                    ".json config file."
-                )
 
             # -------------------------------
             # 6) testing
@@ -334,12 +324,11 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                             step=current_step,
                         )
 
-            if current_step > opt["train"]["total_iter"]:
-                logger.info("Finish training.")
-                model.save(current_step)
-                if opt["rank"] == 0:
-                    wandb.finish()
-                sys.exit()
+    logger.info("Finish training.")
+    model.save(current_step)
+    if opt["rank"] == 0:
+        wandb.finish()
+    sys.exit()
 
 
 if __name__ == "__main__":
