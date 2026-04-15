@@ -327,6 +327,7 @@ def define_G(opt):
             sf=opt_net.get("sf", 4),
             prior_mode=opt_net.get("prior_mode", "recurrent"),
             window_size=opt_net.get("window_size", 3),
+            prior_history_length=opt_net.get("prior_history_length", 1),
             anti_ghost_mode=opt_net.get("anti_ghost_mode", "sigmoid"),
             alignment_mode=opt_net.get("alignment_mode", "spynet"),
             photometric_threshold=opt_net.get("photometric_threshold", 0.5),
