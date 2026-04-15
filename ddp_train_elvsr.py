@@ -196,8 +196,9 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     # Step--4 (main training)
     # ----------------------------------------
     """
-
-    for epoch in range(1000000):  # keep running
+    total_iter = opt["train"]["total_iter"]
+    epoch = 0
+    while current_step < total_iter:  # keep running
 
         # Accelerate's dataloader handles setting the epoch for the internal DistributedSampler
         if hasattr(train_loader, "set_epoch"):
@@ -206,11 +207,12 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
         for i, train_data in enumerate(train_loader):
 
             current_step += 1
-
+            if current_step > total_iter:
+                break
             # -------------------------------
             # 1) update learning rate
             # -------------------------------
-            model.update_learning_rate(current_step)
+            model.update_learning_rate(min(current_step, total_iter))
 
             # -------------------------------
             # 2) feed patch pairs
@@ -245,20 +247,6 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                 # Unwrap the model before saving so checkpoints are compatible with single-GPU loading
                 _unwrap_and_save(model, accelerator, current_step)
 
-            if opt["use_static_graph"] and (current_step == opt["train"]["fix_iter"] - 1):
-                current_step += 1
-                model.update_learning_rate(current_step)
-                if is_main:
-                    _unwrap_and_save(model, accelerator, current_step)
-                current_step -= 1
-                if is_main:
-                    logger.info(
-                        "Saving models ahead of time when changing the computation graph with "
-                        "use_static_graph=True (we need it due to a bug with use_checkpoint=True "
-                        "in distributed training). The training will be terminated by PyTorch in "
-                        "the next iteration. Just resume training with the same .json config file."
-                    )
-
             # -------------------------------
             # 6) testing (only on main process)
             # -------------------------------
@@ -267,20 +255,12 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                 if test_loader is not None:
                     _run_validation(model, test_loader, opt, logger, epoch, current_step)
 
-            # -------------------------------
-            # 7) check termination
-            # -------------------------------
-            if current_step > opt["train"]["total_iter"]:
-                if is_main:
-                    logger.info("Finish training.")
-                    _unwrap_and_save(model, accelerator, current_step)
-                    wandb.finish()
-                accelerator.wait_for_everyone()
-                sys.exit()
-
-    # Should never reach here
     if is_main:
+        logger.info("Finish training.")
+        _unwrap_and_save(model, accelerator, current_step)
         wandb.finish()
+    accelerator.wait_for_everyone()
+    sys.exit()
 
 
 def _unwrap_and_save(model, accelerator, current_step):

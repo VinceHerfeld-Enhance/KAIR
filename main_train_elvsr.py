@@ -175,18 +175,19 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     # Step--4 (main training)
     # ----------------------------------------
     """
-
-    for epoch in range(1000000):  # keep running
+    total_iter = opt["train"]["total_iter"]
+    epoch = 0
+    while current_step < total_iter:  # keep running
         for i, train_data in enumerate(train_loader):
 
             current_step += 1
-            if current_step > opt["train"]["total_iter"]:
+            if current_step > total_iter:
                 break
 
             # -------------------------------
             # 1) update learning rate
             # -------------------------------
-            model.update_learning_rate(min(current_step, opt["train"]["total_iter"]))
+            model.update_learning_rate(min(current_step, total_iter))
 
             # -------------------------------
             # 2) feed patch pairs
@@ -323,6 +324,7 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                             },
                             step=current_step,
                         )
+        epoch += 1
 
     logger.info("Finish training.")
     model.save(current_step)
