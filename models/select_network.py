@@ -338,6 +338,7 @@ def define_G(opt):
             fill_holes=opt_net.get("fill_splat_holes", True),
             residual_prior=opt_net.get("residual_prior", False),
             focus_fill=opt_net.get("focus_fill", False),
+            filling_prior=opt_net.get("filling_prior", False),
             features=opt_net.get("features", 3),
             feature_anti_ghost=opt_net.get("feature_anti_ghost", False),
             state_list=opt_net.get("state_list", ["temp", "up3", "up2", "up1"]),
