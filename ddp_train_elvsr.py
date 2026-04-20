@@ -207,7 +207,7 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
         for i, train_data in enumerate(train_loader):
 
             current_step += 1
-            if current_step > total_iter:
+            if current_step >= total_iter:
                 break
             # -------------------------------
             # 1) update learning rate
