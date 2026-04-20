@@ -23,4 +23,4 @@ export WANDB_MODE=offline
 OPT=$1
 
 # execution
-srun python3 /linkhome/rech/gennip01/ura93tx/Research/KAIR/ddp_train_elvsr.py --opt "$OPT"
+srun idr_accelerate /linkhome/rech/gennip01/ura93tx/Research/KAIR/ddp_train_elvsr.py --opt "$OPT"
