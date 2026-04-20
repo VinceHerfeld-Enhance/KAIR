@@ -6,13 +6,11 @@ from torch.optim import Adam
 
 from models.select_network import define_G
 from models.model_base import ModelBase
-from models.loss import CharbonnierLoss
+from models.loss import CharbonnierFourierLoss, CharbonnierLoss
 from models.loss_ssim import SSIMLoss
 
 from utils.utils_model import test_mode
 from utils.utils_regularizers import regularizer_orth, regularizer_clip
-
-import os
 
 
 class ModelPlain(ModelBase):
@@ -102,6 +100,14 @@ class ModelPlain(ModelBase):
             self.G_lossfn = SSIMLoss().to(self.device)
         elif G_lossfn_type == "charbonnier":
             self.G_lossfn = CharbonnierLoss(self.opt_train["G_charbonnier_eps"]).to(self.device)
+        elif G_lossfn_type in ["charbonnier_fft", "charbonnier_hf"]:
+            self.G_lossfn = CharbonnierFourierLoss(
+                eps=self.opt_train["G_charbonnier_eps"],
+                fft_weight=self.opt_train["G_fft_loss_weight"],
+                fft_loss_type=self.opt_train["G_fft_loss_type"],
+                fft_mask_radius=self.opt_train["G_fft_mask_radius"],
+                fft_mask_ratio=self.opt_train["G_fft_mask_ratio"],
+            ).to(self.device)
         else:
             raise NotImplementedError("Loss type [{:s}] is not found.".format(G_lossfn_type))
         self.G_lossfn_weight = self.opt_train["G_lossfn_weight"]
