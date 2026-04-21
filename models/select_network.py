@@ -335,6 +335,7 @@ def define_G(opt):
             feature_flow_refine=opt_net.get("feature_flow_refine", True),
             refine_features=opt_net.get("refine_features", False),
             n_flows_per_frame=opt_net.get("n_flows_per_frame", 1),
+            flow_refine_mode=opt_net.get("flow_refine_mode", "basic"),
             fill_holes=opt_net.get("fill_splat_holes", True),
             residual_prior=opt_net.get("residual_prior", False),
             focus_fill=opt_net.get("focus_fill", False),
@@ -345,6 +346,7 @@ def define_G(opt):
             state_list=opt_net.get("state_list", ["temp", "up3", "up2", "up1"]),
             ssm_type=opt_net.get("ssm_type", "gru"),
             spynet_path=opt_net.get("spynet_path", "pretrained/spynet.pth"),
+            interpolation_mode=opt_net.get("interpolation_mode", "bilinear"),
         )
 
     else:
