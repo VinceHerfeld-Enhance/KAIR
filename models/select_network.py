@@ -344,7 +344,7 @@ def define_G(opt):
             feature_anti_ghost=opt_net.get("feature_anti_ghost", False),
             anti_ghost_groups=opt_net.get("anti_ghost_groups", 1),
             state_list=opt_net.get("state_list", ["temp", "up3", "up2", "up1"]),
-            ssm_type=opt_net.get("ssm_type", "gru"),
+            feature_refine_ssm_type=opt_net.get("feature_refine_ssm_type", None),
             spynet_path=opt_net.get("spynet_path", "pretrained/spynet.pth"),
             interpolation_mode=opt_net.get("interpolation_mode", "bilinear"),
         )
