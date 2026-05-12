@@ -1,8 +1,11 @@
 from collections import OrderedDict
+import glob
+import os
 import torch
 import torch.nn as nn
 from torch.optim import lr_scheduler
 from torch.optim import Adam
+from torch.amp import GradScaler, autocast
 
 from models.select_network import define_G
 from models.model_base import ModelBase
@@ -46,6 +49,15 @@ class ModelPlain(ModelBase):
         self.define_scheduler()  # define scheduler
         self.log_dict = OrderedDict()  # log
 
+        # mixed precision
+        self.use_amp = self.opt_train.get("use_amp", False)
+        if self.use_amp:
+            self.scaler = GradScaler()
+            self.load_scaler()
+            print("Mixed precision (AMP) training enabled.")
+        else:
+            self.scaler = None
+
     # ----------------------------------------
     # load pre-trained G model
     # ----------------------------------------
@@ -84,6 +96,16 @@ class ModelPlain(ModelBase):
             self.save_network(self.save_dir, self.netE, "E", iter_label)
         if self.opt_train["G_optimizer_reuse"]:
             self.save_optimizer(self.save_dir, self.G_optimizer, "optimizerG", iter_label)
+        if self.use_amp:
+            scaler_path = os.path.join(self.save_dir, "{}_{}.pth".format(iter_label, "scaler"))
+            torch.save(self.scaler.state_dict(), scaler_path)
+
+    def load_scaler(self):
+        scaler_files = glob.glob(os.path.join(self.opt["path"]["models"], "*_scaler.pth"))
+        if scaler_files:
+            latest = max(scaler_files, key=os.path.getmtime)
+            print("Loading scaler [{:s}] ...".format(latest))
+            self.scaler.load_state_dict(torch.load(latest, weights_only=True))
 
     # ----------------------------------------
     # define loss
@@ -180,9 +202,16 @@ class ModelPlain(ModelBase):
     # ----------------------------------------
     def optimize_parameters(self, current_step):
         self.G_optimizer.zero_grad()
-        self.netG_forward()
-        G_loss = self.G_lossfn_weight * self.G_lossfn(self.E, self.H)
-        G_loss.backward()
+
+        if self.use_amp:
+            with autocast(device_type="cuda"):
+                self.netG_forward()
+                G_loss = self.G_lossfn_weight * self.G_lossfn(self.E, self.H)
+            self.scaler.scale(G_loss).backward()
+        else:
+            self.netG_forward()
+            G_loss = self.G_lossfn_weight * self.G_lossfn(self.E, self.H)
+            G_loss.backward()
 
         # ------------------------------------
         # clip_grad
@@ -190,11 +219,17 @@ class ModelPlain(ModelBase):
         # `clip_grad_norm` helps prevent the exploding gradient problem.
         G_optimizer_clipgrad = self.opt_train["G_optimizer_clipgrad"] if self.opt_train["G_optimizer_clipgrad"] else 0
         if G_optimizer_clipgrad > 0:
+            if self.use_amp:
+                self.scaler.unscale_(self.G_optimizer)
             torch.nn.utils.clip_grad_norm_(
-                self.parameters(), max_norm=self.opt_train["G_optimizer_clipgrad"], norm_type=2
+                self.netG.parameters(), max_norm=self.opt_train["G_optimizer_clipgrad"], norm_type=2
             )
 
-        self.G_optimizer.step()
+        if self.use_amp:
+            self.scaler.step(self.G_optimizer)
+            self.scaler.update()
+        else:
+            self.G_optimizer.step()
 
         # ------------------------------------
         # regularizer
@@ -309,8 +344,8 @@ class ModelPlain(ModelBase):
     # ----------------------------------------
     def log_psnr(self):
         # Flatten the first two dimensions (batch and sequence) for visualization
-        E_flat = self.E.flatten(0, 1)
-        H_flat = self.H.flatten(0, 1)
+        E_flat = self.E.detach().float().flatten(0, 1)
+        H_flat = self.H.detach().float().flatten(0, 1)
         mse = nn.MSELoss()(E_flat, H_flat)
         psnr = 10 * torch.log10(1 / mse)
         self.log_dict["PSNR"] = psnr.item()
