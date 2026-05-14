@@ -360,7 +360,8 @@ def define_G(opt):
             modules=opt_net.get("modules", ["backward_1", "forward_1", "backward_2", "forward_2"]),
             splat_window_size=opt_net.get("splat_window_size", 1),
             refine_guidance_mode=opt_net.get("refine_guidance_mode", "occlusion"),
-            refine_splat_mode=opt_net.get("refine_splat_mode", "ones"),
+            flow_refine_feature_source=opt_net.get("flow_refine_feature_source", "reconstruction"),
+            ag_guidance_mode=opt_net.get("ag_guidance_mode", "occlusion"),
             n_flows_per_frame=opt_net.get("n_flows_per_frame", 1),
         )
     elif net_type == "elvsr-bidir-latent":

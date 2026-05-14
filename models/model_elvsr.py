@@ -16,6 +16,40 @@ class ModelELVSR(ModelPlain):
     # define optimizer
     # ----------------------------------------
     def define_optimizer(self):
+        lr_multipliers = self.opt_train.get("G_lr_multipliers", None)
+        if isinstance(lr_multipliers, dict) and len(lr_multipliers) > 0:
+            base_lr = self.opt_train["G_optimizer_lr"]
+            grouped = {}
+            for name, param in self.netG.named_parameters():
+                if not param.requires_grad:
+                    print("Params [{:s}] will not optimize.".format(name))
+                    continue
+
+                mult = 1.0
+                for key, value in lr_multipliers.items():
+                    if key in name:
+                        mult = float(value)
+                        break
+                grouped.setdefault(mult, []).append(param)
+
+            G_optim_params = []
+            for mult in sorted(grouped.keys()):
+                params = grouped[mult]
+                group_lr = base_lr * mult
+                print(f"Optimizer group lr={group_lr:.6g} (x{mult}) with {len(params)} tensors")
+                G_optim_params.append({"params": params, "lr": group_lr})
+
+            if self.opt_train["G_optimizer_type"] == "adam":
+                self.G_optimizer = Adam(
+                    G_optim_params,
+                    lr=base_lr,
+                    betas=self.opt_train["G_optimizer_betas"],
+                    weight_decay=self.opt_train["G_optimizer_wd"],
+                )
+            else:
+                raise NotImplementedError
+            return
+
         self.fix_keys = self.opt_train.get("fix_keys", [])
         if self.opt_train.get("fix_iter", 0) and len(self.fix_keys) > 0:
             fix_lr_mul = self.opt_train["fix_lr_mul"]
