@@ -363,6 +363,8 @@ def define_G(opt):
             flow_refine_feature_source=opt_net.get("flow_refine_feature_source", "reconstruction"),
             ag_guidance_mode=opt_net.get("ag_guidance_mode", "occlusion"),
             n_flows_per_frame=opt_net.get("n_flows_per_frame", 1),
+            propagation_mode=opt_net.get("propagation_mode", "sequential"),
+            num_hier_levels=opt_net.get("num_hier_levels", 2),
         )
     elif net_type == "elvsr-bidir-latent":
         from vsr.research_models.elvsr_bidir_latent import VSRNet
@@ -424,6 +426,33 @@ def define_G(opt):
             enc_nc=opt_net.get("enc_nc", [16, 16, 16, 16]),
             flow_refine_nc=opt_net.get("flow_refine_nc", [32, 64, 128, 128]),
             features=opt_net.get("features", 64),
+        )
+    elif net_type == "elvsr-stvsr":
+        from vsr.research_models.elvsr_spatiotemporal import VSRTemporalNet
+
+        netG = VSRTemporalNet(
+            mid_channels=opt_net.get("mid_channels", 64),
+            num_blocks=opt_net.get("num_blocks", 7),
+            max_residue_magnitude=opt_net.get("max_residue_magnitude", 10),
+            deformable_groups=opt_net.get("deformable_groups", 16),
+            is_low_res_input=opt_net.get("is_low_res_input", True),
+            spynet_path=opt_net.get("spynet_path", None),
+            cpu_cache_length=opt_net.get("cpu_cache_length", 100),
+            prior_nc=opt_net.get("prior_nc", None),
+            modules=opt_net.get("modules", None),
+            splat_window_size=opt_net.get("splat_window_size", 1),
+            sf=opt_net.get("sf", 4),
+            tsf=opt_net.get("tsf", 2),
+            support_radius=opt_net.get("support_radius", None),
+            ag_guidance_mode=opt_net.get("ag_guidance_mode", "occlusion"),
+            refine_flows=opt_net.get("refine_flows", False),
+            n_flows_per_frame=opt_net.get("n_flows_per_frame", 1),
+            refine_features=opt_net.get("refine_features", False),
+            refine_guidance_mode=opt_net.get("refine_guidance_mode", "occlusion"),
+            flow_refine_feature_source=opt_net.get("flow_refine_feature_source", "reconstruction"),
+            learned_surrogate_blend=opt_net.get("learned_surrogate_blend", True),
+            learned_interp_flow=opt_net.get("learned_interp_flow", True),
+            interp_flow_max_residue=opt_net.get("interp_flow_max_residue", 5.0),
         )
     else:
         raise NotImplementedError("netG [{:s}] is not found.".format(net_type))

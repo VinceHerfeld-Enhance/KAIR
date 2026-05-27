@@ -31,7 +31,7 @@ def scandir(dir_path, suffix=None, recursive=False, full_path=False):
 
     def _scandir(dir_path, suffix, recursive):
         for entry in os.scandir(dir_path):
-            if not entry.name.startswith('.') and entry.is_file():
+            if not entry.name.startswith(".") and entry.is_file():
                 if full_path:
                     return_path = entry.path
                 else:
@@ -68,7 +68,7 @@ def read_img_seq(path, require_mod_crop=False, scale=1, return_imgname=False):
         img_paths = path
     else:
         img_paths = sorted(list(scandir(path, full_path=True)))
-    imgs = [cv2.imread(v).astype(np.float32) / 255. for v in img_paths]
+    imgs = [cv2.imread(v).astype(np.float32) / 255.0 for v in img_paths]
 
     if require_mod_crop:
         imgs = [mod_crop(img, scale) for img in imgs]
@@ -97,8 +97,8 @@ def img2tensor(imgs, bgr2rgb=True, float32=True):
 
     def _totensor(img, bgr2rgb, float32):
         if img.shape[2] == 3 and bgr2rgb:
-            if img.dtype == 'float64':
-                img = img.astype('float32')
+            if img.dtype == "float64":
+                img = img.astype("float32")
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         img = torch.from_numpy(img.transpose(2, 0, 1))
         if float32:
@@ -133,7 +133,7 @@ def tensor2img(tensor, rgb2bgr=True, out_type=np.uint8, min_max=(0, 1)):
         shape (H x W). The channel order is BGR.
     """
     if not (torch.is_tensor(tensor) or (isinstance(tensor, list) and all(torch.is_tensor(t) for t in tensor))):
-        raise TypeError(f'tensor or list of tensors expected, got {type(tensor)}')
+        raise TypeError(f"tensor or list of tensors expected, got {type(tensor)}")
 
     if torch.is_tensor(tensor):
         tensor = [tensor]
@@ -159,7 +159,7 @@ def tensor2img(tensor, rgb2bgr=True, out_type=np.uint8, min_max=(0, 1)):
         elif n_dim == 2:
             img_np = _tensor.numpy()
         else:
-            raise TypeError(f'Only support 4D, 3D or 2D tensor. But received with dimension: {n_dim}')
+            raise TypeError(f"Only support 4D, 3D or 2D tensor. But received with dimension: {n_dim}")
         if out_type == np.uint8:
             # Unlike MATLAB, numpy.unit8() WILL NOT round by default.
             img_np = (img_np * 255.0).round()
@@ -237,7 +237,7 @@ def augment(imgs, hflip=True, rotation=True, flows=None, return_status=False):
             return imgs
 
 
-def paired_random_crop(img_gts, img_lqs, gt_patch_size, scale, gt_path=None):
+def paired_random_crop(img_gts, img_lqs, gt_patch_size, scale, gt_path=None, min_variance=0.0, max_retries=5):
     """Paired random crop. Support Numpy array and Tensor inputs.
 
     It crops lists of lq and gt images with corresponding locations.
@@ -252,6 +252,11 @@ def paired_random_crop(img_gts, img_lqs, gt_patch_size, scale, gt_path=None):
         gt_patch_size (int): GT patch size.
         scale (int): Scale factor.
         gt_path (str): Path to ground-truth. Default: None.
+        min_variance (float): Minimum variance threshold for LQ patches.
+            If > 0, crops with variance below this are re-rolled up to
+            max_retries times. Default: 0.0 (disabled).
+        max_retries (int): Maximum number of re-rolls for low-variance
+            crops. Default: 5.
 
     Returns:
         list[ndarray] | ndarray: GT images and LQ images. If returned results
@@ -264,9 +269,9 @@ def paired_random_crop(img_gts, img_lqs, gt_patch_size, scale, gt_path=None):
         img_lqs = [img_lqs]
 
     # determine input type: Numpy array or Tensor
-    input_type = 'Tensor' if torch.is_tensor(img_gts[0]) else 'Numpy'
+    input_type = "Tensor" if torch.is_tensor(img_gts[0]) else "Numpy"
 
-    if input_type == 'Tensor':
+    if input_type == "Tensor":
         h_lq, w_lq = img_lqs[0].size()[-2:]
         h_gt, w_gt = img_gts[0].size()[-2:]
     else:
@@ -275,29 +280,49 @@ def paired_random_crop(img_gts, img_lqs, gt_patch_size, scale, gt_path=None):
     lq_patch_size = gt_patch_size // scale
 
     if h_gt != h_lq * scale or w_gt != w_lq * scale:
-        raise ValueError(f'Scale mismatches. GT ({h_gt}, {w_gt}) is not {scale}x ',
-                         f'multiplication of LQ ({h_lq}, {w_lq}).')
+        raise ValueError(
+            f"Scale mismatches. GT ({h_gt}, {w_gt}) is not {scale}x ", f"multiplication of LQ ({h_lq}, {w_lq})."
+        )
     if h_lq < lq_patch_size or w_lq < lq_patch_size:
-        raise ValueError(f'LQ ({h_lq}, {w_lq}) is smaller than patch size '
-                         f'({lq_patch_size}, {lq_patch_size}). '
-                         f'Please remove {gt_path}.')
+        raise ValueError(
+            f"LQ ({h_lq}, {w_lq}) is smaller than patch size "
+            f"({lq_patch_size}, {lq_patch_size}). "
+            f"Please remove {gt_path}."
+        )
 
-    # randomly choose top and left coordinates for lq patch
-    top = random.randint(0, h_lq - lq_patch_size)
-    left = random.randint(0, w_lq - lq_patch_size)
+    # randomly choose top and left coordinates for lq patch,
+    # optionally re-rolling low-variance crops
+    n_tries = max_retries if min_variance > 0 else 0
+    for _ in range(n_tries + 1):
+        top = random.randint(0, h_lq - lq_patch_size)
+        left = random.randint(0, w_lq - lq_patch_size)
+
+        if min_variance <= 0:
+            break
+
+        # compute variance on first LQ frame
+        if input_type == "Tensor":
+            patch = img_lqs[0][:, top : top + lq_patch_size, left : left + lq_patch_size]
+            var = patch.var().item()
+        else:
+            patch = img_lqs[0][top : top + lq_patch_size, left : left + lq_patch_size, ...]
+            var = patch.var()
+
+        if var >= min_variance:
+            break
 
     # crop lq patch
-    if input_type == 'Tensor':
-        img_lqs = [v[:, :, top:top + lq_patch_size, left:left + lq_patch_size] for v in img_lqs]
+    if input_type == "Tensor":
+        img_lqs = [v[:, :, top : top + lq_patch_size, left : left + lq_patch_size] for v in img_lqs]
     else:
-        img_lqs = [v[top:top + lq_patch_size, left:left + lq_patch_size, ...] for v in img_lqs]
+        img_lqs = [v[top : top + lq_patch_size, left : left + lq_patch_size, ...] for v in img_lqs]
 
     # crop corresponding gt patch
     top_gt, left_gt = int(top * scale), int(left * scale)
-    if input_type == 'Tensor':
-        img_gts = [v[:, :, top_gt:top_gt + gt_patch_size, left_gt:left_gt + gt_patch_size] for v in img_gts]
+    if input_type == "Tensor":
+        img_gts = [v[:, :, top_gt : top_gt + gt_patch_size, left_gt : left_gt + gt_patch_size] for v in img_gts]
     else:
-        img_gts = [v[top_gt:top_gt + gt_patch_size, left_gt:left_gt + gt_patch_size, ...] for v in img_gts]
+        img_gts = [v[top_gt : top_gt + gt_patch_size, left_gt : left_gt + gt_patch_size, ...] for v in img_gts]
     if len(img_gts) == 1:
         img_gts = img_gts[0]
     if len(img_lqs) == 1:
@@ -336,11 +361,12 @@ class MemcachedBackend(BaseStorageBackend):
     def __init__(self, server_list_cfg, client_cfg, sys_path=None):
         if sys_path is not None:
             import sys
+
             sys.path.append(sys_path)
         try:
             import mc
         except ImportError:
-            raise ImportError('Please install memcached to enable MemcachedBackend.')
+            raise ImportError("Please install memcached to enable MemcachedBackend.")
 
         self.server_list_cfg = server_list_cfg
         self.client_cfg = client_cfg
@@ -351,6 +377,7 @@ class MemcachedBackend(BaseStorageBackend):
     def get(self, filepath):
         filepath = str(filepath)
         import mc
+
         self._client.Get(filepath, self._mc_buffer)
         value_buf = mc.ConvertBuffer(self._mc_buffer)
         return value_buf
@@ -364,13 +391,13 @@ class HardDiskBackend(BaseStorageBackend):
 
     def get(self, filepath):
         filepath = str(filepath)
-        with open(filepath, 'rb') as f:
+        with open(filepath, "rb") as f:
             value_buf = f.read()
         return value_buf
 
     def get_text(self, filepath):
         filepath = str(filepath)
-        with open(filepath, 'r') as f:
+        with open(filepath, "r") as f:
             value_buf = f.read()
         return value_buf
 
@@ -395,11 +422,11 @@ class LmdbBackend(BaseStorageBackend):
         _client (list): A list of several lmdb envs.
     """
 
-    def __init__(self, db_paths, client_keys='default', readonly=True, lock=False, readahead=False, **kwargs):
+    def __init__(self, db_paths, client_keys="default", readonly=True, lock=False, readahead=False, **kwargs):
         try:
             import lmdb
         except ImportError:
-            raise ImportError('Please install lmdb to enable LmdbBackend.')
+            raise ImportError("Please install lmdb to enable LmdbBackend.")
 
         if isinstance(client_keys, str):
             client_keys = [client_keys]
@@ -408,8 +435,10 @@ class LmdbBackend(BaseStorageBackend):
             self.db_paths = [str(v) for v in db_paths]
         elif isinstance(db_paths, str):
             self.db_paths = [str(db_paths)]
-        assert len(client_keys) == len(self.db_paths), ('client_keys and db_paths should have the same length, '
-                                                        f'but received {len(client_keys)} and {len(self.db_paths)}.')
+        assert len(client_keys) == len(self.db_paths), (
+            "client_keys and db_paths should have the same length, "
+            f"but received {len(client_keys)} and {len(self.db_paths)}."
+        )
 
         self._client = {}
         for client, path in zip(client_keys, self.db_paths):
@@ -423,10 +452,10 @@ class LmdbBackend(BaseStorageBackend):
             client_key (str): Used for distinguishing different lmdb envs.
         """
         filepath = str(filepath)
-        assert client_key in self._client, (f'client_key {client_key} is not ' 'in lmdb clients.')
+        assert client_key in self._client, f"client_key {client_key} is not " "in lmdb clients."
         client = self._client[client_key]
         with client.begin(write=False) as txn:
-            value_buf = txn.get(filepath.encode('ascii'))
+            value_buf = txn.get(filepath.encode("ascii"))
         return value_buf
 
     def get_text(self, filepath):
@@ -447,22 +476,23 @@ class FileClient(object):
     """
 
     _backends = {
-        'disk': HardDiskBackend,
-        'memcached': MemcachedBackend,
-        'lmdb': LmdbBackend,
+        "disk": HardDiskBackend,
+        "memcached": MemcachedBackend,
+        "lmdb": LmdbBackend,
     }
 
-    def __init__(self, backend='disk', **kwargs):
+    def __init__(self, backend="disk", **kwargs):
         if backend not in self._backends:
-            raise ValueError(f'Backend {backend} is not supported. Currently supported ones'
-                             f' are {list(self._backends.keys())}')
+            raise ValueError(
+                f"Backend {backend} is not supported. Currently supported ones" f" are {list(self._backends.keys())}"
+            )
         self.backend = backend
         self.client = self._backends[backend](**kwargs)
 
-    def get(self, filepath, client_key='default'):
+    def get(self, filepath, client_key="default"):
         # client_key is used only for lmdb, where different fileclients have
         # different lmdb environments.
-        if self.backend == 'lmdb':
+        if self.backend == "lmdb":
             return self.client.get(filepath, client_key)
         else:
             return self.client.get(filepath)
@@ -471,7 +501,7 @@ class FileClient(object):
         return self.client.get_text(filepath)
 
 
-def imfrombytes(content, flag='color', float32=False):
+def imfrombytes(content, flag="color", float32=False):
     """Read an image from bytes.
 
     Args:
@@ -485,9 +515,8 @@ def imfrombytes(content, flag='color', float32=False):
         ndarray: Loaded image array.
     """
     img_np = np.frombuffer(content, np.uint8)
-    imread_flags = {'color': cv2.IMREAD_COLOR, 'grayscale': cv2.IMREAD_GRAYSCALE, 'unchanged': cv2.IMREAD_UNCHANGED}
+    imread_flags = {"color": cv2.IMREAD_COLOR, "grayscale": cv2.IMREAD_GRAYSCALE, "unchanged": cv2.IMREAD_UNCHANGED}
     img = cv2.imdecode(img_np, imread_flags[flag])
     if float32:
-        img = img.astype(np.float32) / 255.
+        img = img.astype(np.float32) / 255.0
     return img
-

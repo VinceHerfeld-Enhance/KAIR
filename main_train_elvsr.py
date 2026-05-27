@@ -22,9 +22,56 @@ from models.select_model import define_Model
 
 import wandb
 
+
+def _extract_frame_number(filename):
+    """Extract the numeric frame index from a filename like '00017.png' or 'frame_000017.png'."""
+    import re
+
+    stem = os.path.splitext(filename)[0]
+    numbers = re.findall(r"\d+", stem)
+    return int(numbers[-1]) if numbers else None
+
+
+def _load_test_lr_indices(test_list_dir, folder_name, all_gt_paths):
+    """Load LR frame indices from a test_list .txt file.
+
+    Args:
+        test_list_dir: Directory containing {folder}_im_list.txt files.
+        folder_name: Video folder name (e.g. 'GOPR9635').
+        all_gt_paths: List of all GT frame paths for this folder.
+
+    Returns:
+        lr_indices: LR frame indices into the full GT sequence.
+        gt_start: First LR frame index (inclusive).
+        gt_end: Last LR frame index (inclusive).
+    """
+    list_path = os.path.join(test_list_dir, f"{folder_name}_im_list.txt")
+    with open(list_path, "r") as f:
+        lr_filenames = [line.strip() for line in f if line.strip()]
+
+    lr_frame_numbers = set(_extract_frame_number(fn) for fn in lr_filenames)
+    lr_frame_numbers.discard(None)
+
+    # Build mapping from frame number -> index in the full GT sequence
+    gt_basenames = [os.path.basename(p) for p in all_gt_paths]
+    gt_frame_numbers = [_extract_frame_number(name) for name in gt_basenames]
+    lr_indices = sorted([i for i, num in enumerate(gt_frame_numbers) if num in lr_frame_numbers])
+
+    assert len(lr_indices) == len(lr_filenames), (
+        f"Could not match all LR frames for {folder_name}: " f"found {len(lr_indices)}/{len(lr_filenames)} in GT folder"
+    )
+
+    return lr_indices, lr_indices[0], lr_indices[-1]
+
+
 """
 # --------------------------------------------
 # training code for ELVSR
+# Supports temporal super-resolution (TSR):
+#   When netG.tsf > 1, the LR input is temporally subsampled
+#   by keeping every tsf-th frame. The model reconstructs
+#   all intermediate frames and loss is computed over the
+#   full HR sequence.
 # --------------------------------------------
 """
 
@@ -111,6 +158,23 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+    # ----------------------------------------
+    # temporal scale factor (TSR)
+    # ----------------------------------------
+    tsf = int(opt["netG"].get("tsf", 1)) if opt["netG"] is not None else 1
+    if tsf > 1 and opt["rank"] == 0:
+        logger.info(f"Temporal super-resolution enabled: tsf={tsf}")
+        num_frame = opt["datasets"]["train"]["num_frame"]
+        assert (num_frame - 1) % tsf == 0, (
+            f"num_frame ({num_frame}) must satisfy (num_frame - 1) % tsf == 0 "
+            f"for temporal SR with tsf={tsf}. "
+            f"Valid values: {[k * tsf + 1 for k in range(1, 20)]}"
+        )
+        logger.info(
+            f"  Dataset num_frame={num_frame} -> model input: {(num_frame - 1) // tsf + 1} frames, "
+            f"output: {num_frame} frames"
+        )
+
     """
     # ----------------------------------------
     # Step--2 (creat dataloader)
@@ -192,6 +256,10 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
             # -------------------------------
             # 2) feed patch pairs
             # -------------------------------
+            if tsf > 1:
+                # Temporally subsample LR: keep every tsf-th frame
+                # H stays full so loss covers all frames
+                train_data["L"] = train_data["L"][:, ::tsf]
             model.feed_data(train_data)
 
             # -------------------------------
@@ -216,6 +284,27 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                     wandb.log({"train/lr": model.current_learning_rate()}, step=current_step)
 
             # -------------------------------
+            # 4b) debug: save train frames
+            # -------------------------------
+            debug_every = opt["train"]["checkpoint_debug_frames"] if opt["train"] else None
+            if debug_every and current_step % debug_every == 0 and opt["rank"] == 0:
+                visuals = model.current_visuals()  # L: [T_in,C,H,W], E: [T_out,C,H,W], H: [T_out,C,H,W]
+                debug_dir = os.path.join(opt["path"]["images"], "debug_train")
+                for key in ["L", "E", "H"]:
+                    if key not in visuals:
+                        continue
+                    frames = visuals[key].clamp_(0, 1).numpy()
+                    out_dir = os.path.join(debug_dir, f"iter_{current_step:08d}", key)
+                    os.makedirs(out_dir, exist_ok=True)
+                    for fi in range(frames.shape[0]):
+                        img = frames[fi]
+                        if img.ndim == 3:
+                            img = np.transpose(img[[2, 1, 0], :, :], (1, 2, 0))
+                        img = (img * 255.0).round().astype(np.uint8)
+                        cv2.imwrite(os.path.join(out_dir, f"{fi:04d}.png"), img)
+                logger.info(f"Debug train frames saved to {debug_dir}/iter_{current_step:08d}/")
+
+            # -------------------------------
             # 5) save model
             # -------------------------------
             if current_step % opt["train"]["checkpoint_save"] == 0 and opt["rank"] == 0:
@@ -233,14 +322,30 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                 test_results["psnr_y"] = []
                 test_results["ssim_y"] = []
 
+                test_list_dir = opt["datasets"]["test"].get("test_list_dir", None) if opt["datasets"]["test"] else None
+
                 for idx, test_data in enumerate(test_loader):
+                    folder = test_data["folder"]
+
+                    if test_list_dir is not None:
+                        # Adobe240-style: LQ and GT are already filtered by
+                        # the dataset to only include the effective frames.
+                        pass
+                    elif tsf > 1:
+                        test_data["L"] = test_data["L"][:, ::tsf]
+
                     model.feed_data(test_data)
                     model.test()
 
                     visuals = model.current_visuals()
                     output = visuals["E"]
                     gt = visuals["H"] if "H" in visuals else None
-                    folder = test_data["folder"]
+
+                    # For temporal SR the model may output fewer frames than
+                    # the full GT sequence (when T-1 is not divisible by tsf).
+                    # Trim GT to match output length.
+                    if gt is not None and gt.shape[0] > output.shape[0]:
+                        gt = gt[: output.shape[0]]
 
                     test_results_folder = OrderedDict()
                     test_results_folder["psnr"] = []

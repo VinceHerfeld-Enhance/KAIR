@@ -2,7 +2,7 @@ import argparse
 from os import path as osp
 import sys
 
-kair_root = osp.abspath(osp.join(osp.dirname(__file__), "../../.."))
+kair_root = osp.abspath(osp.join(osp.dirname(__file__), "../.."))
 sys.path.append(kair_root)
 
 from utils.utils_video import scandir
@@ -370,6 +370,63 @@ def prepare_keys_reds_orig(folder_path):
     return img_path_list, keys
 
 
+def create_lmdb_for_adobe240():
+    """Create lmdb files for Adobe240fps dataset.
+
+    Usage:
+        The dataset is expected at
+        /home/vherfeld/storage/vherfeld/datasets/Adobe240
+        with sub-folders per clip containing PNG frames.
+        Remember to modify opt configurations according to your settings.
+    """
+    # # train hr
+    # folder_path = "/home/vherfeld/storage/vherfeld/datasets/Adobe240/hr"
+    # lmdb_path = "/home/vherfeld/storage/vherfeld/datasets/Adobe240/train_hr.lmdb"
+    # img_path_list, keys = prepare_keys_adobe240(folder_path)
+    # make_lmdb_from_imgs(
+    #     folder_path,
+    #     lmdb_path,
+    #     img_path_list,
+    #     keys,
+    #     multiprocessing_read=True,
+    #     multiprocessing_mode="stream",
+    #     n_thread=12,
+    #     multiprocessing_chunksize=16,
+    # )
+
+    # train_lr
+    folder_path = "/home/vherfeld/storage/vherfeld/datasets/Adobe240/lr"
+    lmdb_path = "/home/vherfeld/storage/vherfeld/datasets/Adobe240/train_lr.lmdb"
+    img_path_list, keys = prepare_keys_adobe240(folder_path)
+    make_lmdb_from_imgs(
+        folder_path,
+        lmdb_path,
+        img_path_list,
+        keys,
+        multiprocessing_read=True,
+        multiprocessing_mode="stream",
+        n_thread=12,
+        multiprocessing_chunksize=16,
+    )
+
+
+def prepare_keys_adobe240(folder_path):
+    """Prepare image path list and keys for Adobe240fps dataset.
+
+    Args:
+        folder_path (str): Folder path.
+
+    Returns:
+        list[str]: Image path list.
+        list[str]: Key list.
+    """
+    print("Reading image path list ...")
+    img_path_list = sorted(list(scandir(folder_path, suffix="png", recursive=True)))
+    keys = [v.split(".png")[0] for v in img_path_list]  # example: clip/00000000
+
+    return img_path_list, keys
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
@@ -378,7 +435,7 @@ if __name__ == "__main__":
         type=str,
         help=(
             "Options: 'DIV2K', 'REDS', 'Vimeo90K', 'Vimeo90K_BD', 'DVD', 'GoPro',"
-            "'DAVIS', 'LDV', 'REDS_orig' "
+            "'DAVIS', 'LDV', 'REDS_orig', 'Adobe240' "
             "You may need to modify the corresponding configurations in codes."
         ),
     )
@@ -402,5 +459,7 @@ if __name__ == "__main__":
         create_lmdb_for_ldv()
     elif dataset == "reds_orig":
         create_lmdb_for_reds_orig()
+    elif dataset == "adobe240":
+        create_lmdb_for_adobe240()
     else:
         raise ValueError("Wrong dataset.")

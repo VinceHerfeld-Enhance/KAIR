@@ -198,6 +198,12 @@ class ModelPlain(ModelBase):
         self.E = self.netG(self.L)
 
     # ----------------------------------------
+    # compute generator loss (can be overridden by subclasses)
+    # ----------------------------------------
+    def compute_G_loss(self):
+        return self.G_lossfn_weight * self.G_lossfn(self.E, self.H)
+
+    # ----------------------------------------
     # update parameters and get loss
     # ----------------------------------------
     def optimize_parameters(self, current_step):
@@ -206,11 +212,11 @@ class ModelPlain(ModelBase):
         if self.use_amp:
             with autocast(device_type="cuda"):
                 self.netG_forward()
-                G_loss = self.G_lossfn_weight * self.G_lossfn(self.E, self.H)
+                G_loss = self.compute_G_loss()
             self.scaler.scale(G_loss).backward()
         else:
             self.netG_forward()
-            G_loss = self.G_lossfn_weight * self.G_lossfn(self.E, self.H)
+            G_loss = self.compute_G_loss()
             G_loss.backward()
 
         # ------------------------------------

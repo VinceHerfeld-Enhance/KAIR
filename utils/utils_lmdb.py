@@ -6,15 +6,19 @@ from os import path as osp
 from tqdm import tqdm
 
 
-def make_lmdb_from_imgs(data_path,
-                        lmdb_path,
-                        img_path_list,
-                        keys,
-                        batch=5000,
-                        compress_level=1,
-                        multiprocessing_read=False,
-                        n_thread=40,
-                        map_size=None):
+def make_lmdb_from_imgs(
+    data_path,
+    lmdb_path,
+    img_path_list,
+    keys,
+    batch=5000,
+    compress_level=1,
+    multiprocessing_read=False,
+    n_thread=40,
+    multiprocessing_mode="full",
+    multiprocessing_chunksize=8,
+    map_size=None,
+):
     """Make lmdb from images.
 
     Contents of lmdb. The file structure is:
@@ -40,8 +44,13 @@ def make_lmdb_from_imgs(data_path,
 
     We use the image name without extension as the lmdb key.
 
-    If `multiprocessing_read` is True, it will read all the images to memory
-    using multiprocessing. Thus, your server needs to have enough memory.
+    If `multiprocessing_read` is True and `multiprocessing_mode` is 'full',
+    it will read all the images to memory using multiprocessing. Thus, your
+    server needs to have enough memory.
+
+    If `multiprocessing_read` is True and `multiprocessing_mode` is 'stream',
+    images are read in parallel and written to lmdb as they are returned,
+    which significantly reduces peak RAM usage.
 
     Args:
         data_path (str): Data path for reading images.
@@ -54,32 +63,43 @@ def make_lmdb_from_imgs(data_path,
         multiprocessing_read (bool): Whether use multiprocessing to read all
             the images to memory. Default: False.
         n_thread (int): For multiprocessing.
+        multiprocessing_mode (str): Multiprocessing strategy when
+            `multiprocessing_read` is True.
+            - 'full': preload all encoded images in memory (faster, high RAM).
+            - 'stream': read in parallel and write incrementally (lower RAM).
+            Default: 'full'.
+        multiprocessing_chunksize (int): chunksize for worker scheduling in
+            stream mode. Default: 8.
         map_size (int | None): Map size for lmdb env. If None, use the
             estimated size from images. Default: None
     """
 
-    assert len(img_path_list) == len(keys), ('img_path_list and keys should have the same length, '
-                                             f'but got {len(img_path_list)} and {len(keys)}')
-    print(f'Create lmdb for {data_path}, save to {lmdb_path}...')
-    print(f'Totoal images: {len(img_path_list)}')
-    if not lmdb_path.endswith('.lmdb'):
+    assert len(img_path_list) == len(keys), (
+        "img_path_list and keys should have the same length, " f"but got {len(img_path_list)} and {len(keys)}"
+    )
+    print(f"Create lmdb for {data_path}, save to {lmdb_path}...")
+    print(f"Totoal images: {len(img_path_list)}")
+    if not lmdb_path.endswith(".lmdb"):
         raise ValueError("lmdb_path must end with '.lmdb'.")
     if osp.exists(lmdb_path):
-        print(f'Folder {lmdb_path} already exists. Exit.')
+        print(f"Folder {lmdb_path} already exists. Exit.")
         sys.exit(1)
 
-    if multiprocessing_read:
+    if multiprocessing_mode not in ("full", "stream"):
+        raise ValueError("multiprocessing_mode must be either 'full' or 'stream'.")
+
+    if multiprocessing_read and multiprocessing_mode == "full":
         # read all the images to memory (multiprocessing)
         dataset = {}  # use dict to keep the order for multiprocessing
         shapes = {}
-        print(f'Read images with multiprocessing, #thread: {n_thread} ...')
-        pbar = tqdm(total=len(img_path_list), unit='image')
+        print(f"Read images with multiprocessing, #thread: {n_thread} ...")
+        pbar = tqdm(total=len(img_path_list), unit="image")
 
         def callback(arg):
             """get the image data and update pbar."""
             key, dataset[key], shapes[key] = arg
             pbar.update(1)
-            pbar.set_description(f'Read {key}')
+            pbar.set_description(f"Read {key}")
 
         pool = Pool(n_thread)
         for path, key in zip(img_path_list, keys):
@@ -87,46 +107,74 @@ def make_lmdb_from_imgs(data_path,
         pool.close()
         pool.join()
         pbar.close()
-        print(f'Finish reading {len(img_path_list)} images.')
+        print(f"Finish reading {len(img_path_list)} images.")
 
     # create lmdb environment
     if map_size is None:
         # obtain data size for one image
         img = cv2.imread(osp.join(data_path, img_path_list[0]), cv2.IMREAD_UNCHANGED)
-        _, img_byte = cv2.imencode('.png', img, [cv2.IMWRITE_PNG_COMPRESSION, compress_level])
+        _, img_byte = cv2.imencode(".png", img, [cv2.IMWRITE_PNG_COMPRESSION, compress_level])
         data_size_per_img = img_byte.nbytes
-        print('Data size per image is: ', data_size_per_img)
+        print("Data size per image is: ", data_size_per_img)
         data_size = data_size_per_img * len(img_path_list)
         map_size = data_size * 10
 
     env = lmdb.open(lmdb_path, map_size=map_size)
 
     # write data to lmdb
-    pbar = tqdm(total=len(img_path_list), unit='chunk')
     txn = env.begin(write=True)
-    txt_file = open(osp.join(lmdb_path, 'meta_info.txt'), 'w')
-    for idx, (path, key) in enumerate(zip(img_path_list, keys)):
-        pbar.update(1)
-        pbar.set_description(f'Write {key}')
-        key_byte = key.encode('ascii')
-        if multiprocessing_read:
-            img_byte = dataset[key]
-            h, w, c = shapes[key]
-        else:
-            _, img_byte, img_shape = read_img_worker(osp.join(data_path, path), key, compress_level)
-            h, w, c = img_shape
+    txt_file = open(osp.join(lmdb_path, "meta_info.txt"), "w")
 
-        txn.put(key_byte, img_byte)
-        # write meta information
-        txt_file.write(f'{key}.png ({h},{w},{c}) {compress_level}\n')
-        if idx % batch == 0:
-            txn.commit()
-            txn = env.begin(write=True)
-    pbar.close()
+    if multiprocessing_read and multiprocessing_mode == "stream":
+        print(
+            f"Read images with multiprocessing stream mode, "
+            f"#thread: {n_thread}, chunksize: {multiprocessing_chunksize} ..."
+        )
+        pbar = tqdm(total=len(img_path_list), unit="image")
+
+        pool = Pool(n_thread)
+        worker_args = ((osp.join(data_path, path), key, compress_level) for path, key in zip(img_path_list, keys))
+        for idx, (key, img_byte, img_shape) in enumerate(
+            pool.imap_unordered(read_img_worker_star, worker_args, chunksize=multiprocessing_chunksize)
+        ):
+            pbar.update(1)
+            pbar.set_description(f"Write {key}")
+            key_byte = key.encode("ascii")
+            h, w, c = img_shape
+            txn.put(key_byte, img_byte)
+            txt_file.write(f"{key}.png ({h},{w},{c}) {compress_level}\n")
+            if idx % batch == 0:
+                txn.commit()
+                txn = env.begin(write=True)
+
+        pool.close()
+        pool.join()
+        pbar.close()
+    else:
+        pbar = tqdm(total=len(img_path_list), unit="chunk")
+        for idx, (path, key) in enumerate(zip(img_path_list, keys)):
+            pbar.update(1)
+            pbar.set_description(f"Write {key}")
+            key_byte = key.encode("ascii")
+            if multiprocessing_read:
+                img_byte = dataset[key]
+                h, w, c = shapes[key]
+            else:
+                _, img_byte, img_shape = read_img_worker(osp.join(data_path, path), key, compress_level)
+                h, w, c = img_shape
+
+            txn.put(key_byte, img_byte)
+            # write meta information
+            txt_file.write(f"{key}.png ({h},{w},{c}) {compress_level}\n")
+            if idx % batch == 0:
+                txn.commit()
+                txn = env.begin(write=True)
+        pbar.close()
+
     txn.commit()
     env.close()
     txt_file.close()
-    print('\nFinish writing lmdb.')
+    print("\nFinish writing lmdb.")
 
 
 def read_img_worker(path, key, compress_level):
@@ -146,9 +194,10 @@ def read_img_worker(path, key, compress_level):
     img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
     # deal with `libpng error: Read Error`
     if img is None:
-        print(f'To deal with `libpng error: Read Error`, use PIL to load {path}')
+        print(f"To deal with `libpng error: Read Error`, use PIL to load {path}")
         from PIL import Image
         import numpy as np
+
         img = Image.open(path)
         img = np.asanyarray(img)
         img = img[:, :, [2, 1, 0]]
@@ -158,11 +207,16 @@ def read_img_worker(path, key, compress_level):
         c = 1
     else:
         h, w, c = img.shape
-    _, img_byte = cv2.imencode('.png', img, [cv2.IMWRITE_PNG_COMPRESSION, compress_level])
+    _, img_byte = cv2.imencode(".png", img, [cv2.IMWRITE_PNG_COMPRESSION, compress_level])
     return (key, img_byte, (h, w, c))
 
 
-class LmdbMaker():
+def read_img_worker_star(args):
+    """Helper to unpack worker arguments for imap_unordered."""
+    return read_img_worker(*args)
+
+
+class LmdbMaker:
     """LMDB Maker.
 
     Args:
@@ -174,10 +228,10 @@ class LmdbMaker():
     """
 
     def __init__(self, lmdb_path, map_size=1024**4, batch=5000, compress_level=1):
-        if not lmdb_path.endswith('.lmdb'):
+        if not lmdb_path.endswith(".lmdb"):
             raise ValueError("lmdb_path must end with '.lmdb'.")
         if osp.exists(lmdb_path):
-            print(f'Folder {lmdb_path} already exists. Exit.')
+            print(f"Folder {lmdb_path} already exists. Exit.")
             sys.exit(1)
 
         self.lmdb_path = lmdb_path
@@ -185,16 +239,16 @@ class LmdbMaker():
         self.compress_level = compress_level
         self.env = lmdb.open(lmdb_path, map_size=map_size)
         self.txn = self.env.begin(write=True)
-        self.txt_file = open(osp.join(lmdb_path, 'meta_info.txt'), 'w')
+        self.txt_file = open(osp.join(lmdb_path, "meta_info.txt"), "w")
         self.counter = 0
 
     def put(self, img_byte, key, img_shape):
         self.counter += 1
-        key_byte = key.encode('ascii')
+        key_byte = key.encode("ascii")
         self.txn.put(key_byte, img_byte)
         # write meta information
         h, w, c = img_shape
-        self.txt_file.write(f'{key}.png ({h},{w},{c}) {self.compress_level}\n')
+        self.txt_file.write(f"{key}.png ({h},{w},{c}) {self.compress_level}\n")
         if self.counter % self.batch == 0:
             self.txn.commit()
             self.txn = self.env.begin(write=True)

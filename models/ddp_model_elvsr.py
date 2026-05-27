@@ -1,20 +1,16 @@
 import torch
 from torch.optim import Adam
-from models.model_plain import ModelPlain
+from models.model_elvsr import ModelELVSR
 from collections import OrderedDict
-
 
 # filepath: /home/vherfeld/Research/KAIR/models/ddp_model_elvsr.py
 
 
-class DDPModelELVSR(ModelPlain):
+class DDPModelELVSR(ModelELVSR):
     """Train video restoration with pixel loss, compatible with HuggingFace Accelerate DDP."""
 
     def __init__(self, opt):
         super(DDPModelELVSR, self).__init__(opt)
-        self.fix_iter = self.opt_train.get("fix_iter", 0)
-        self.fix_keys = self.opt_train.get("fix_keys", [])
-        self.fix_unflagged = True
         # Will be set by the training script after accelerator.prepare()
         self.accelerator = None
 
@@ -71,8 +67,7 @@ class DDPModelELVSR(ModelPlain):
     # feed data
     # ----------------------------------------
     def feed_data(self, data, need_H=True):
-        # Data may already be on the correct device via accelerate's dataloader,
-        # but during validation we may need to move it manually.
+        # Move data to correct device (accelerate may have already done this)
         self.L = data["L"]
         if not self.L.is_cuda and self.accelerator is not None:
             self.L = self.L.to(self.accelerator.device)
@@ -85,6 +80,24 @@ class DDPModelELVSR(ModelPlain):
                 self.H = self.H.to(self.accelerator.device)
             elif not self.H.is_cuda:
                 self.H = self.H.to(self.device)
+
+        # Sparse GT indices (from ModelELVSR)
+        if "gt_indices" in data:
+            self.gt_indices = data["gt_indices"]
+            if not self.gt_indices.is_cuda:
+                dev = self.accelerator.device if self.accelerator is not None else self.device
+                self.gt_indices = self.gt_indices.to(dev)
+        else:
+            self.gt_indices = None
+
+        # Full GT for flow supervision
+        if "H_full" in data:
+            self.H_full = data["H_full"]
+            if not self.H_full.is_cuda:
+                dev = self.accelerator.device if self.accelerator is not None else self.device
+                self.H_full = self.H_full.to(dev)
+        else:
+            self.H_full = self.H
 
     # ----------------------------------------
     # update parameters and get loss
@@ -117,7 +130,7 @@ class DDPModelELVSR(ModelPlain):
         self.G_optimizer.zero_grad()
         self.netG.train()
         self.E = self.netG(self.L)
-        loss = self.G_lossfn(self.E, self.H)
+        loss = self.compute_G_loss()
 
         # Backward via accelerator (handles gradient scaling, sync, etc.)
         if self.accelerator is not None:
@@ -166,15 +179,16 @@ class DDPModelELVSR(ModelPlain):
     # ----------------------------------------
     def test(self):
         n = self.L.size(1)
+        tsf = self.tsf
         net = self.get_bare_model(self.netG)
         net.eval()
 
         pad_seq = self.opt_train.get("pad_seq", False)
-        flip_seq = self.opt_train.get("flip_seq", False)
+        # flip_seq is incompatible with tsf > 1 (junction creates artifacts)
+        flip_seq = self.opt_train.get("flip_seq", False) and tsf == 1
         self.center_frame_only = self.opt_train.get("center_frame_only", False)
 
         if pad_seq:
-            n = n + 1
             self.L = torch.cat([self.L, self.L[:, -1:, :, :, :]], dim=1)
 
         if flip_seq:
@@ -184,16 +198,18 @@ class DDPModelELVSR(ModelPlain):
             self.E = self._test_video(self.L)
 
         if flip_seq:
-            output_1 = self.E[:, :n, :, :, :]
-            output_2 = self.E[:, n:, :, :, :].flip(1)
+            n_out = n  # tsf == 1 here
+            output_1 = self.E[:, :n_out, :, :, :]
+            output_2 = self.E[:, n_out:, :, :, :].flip(1)
             self.E = 0.5 * (output_1 + output_2)
 
         if pad_seq:
-            n = n - 1
-            self.E = self.E[:, :n, :, :, :]
+            n_out = self._n_out(n)
+            self.E = self.E[:, :n_out, :, :, :]
 
         if self.center_frame_only:
-            self.E = self.E[:, n // 2, :, :, :]
+            n_out = self.E.size(1)
+            self.E = self.E[:, n_out // 2, :, :, :]
 
         net.train()
 
@@ -208,6 +224,7 @@ class DDPModelELVSR(ModelPlain):
     def _test_video(self, lq):
         """Test the video as a whole or as clips (divided temporally)."""
         num_frame_testing = self.opt["val"].get("num_frame_testing", 0)
+        tsf = self.tsf
 
         if num_frame_testing:
             sf = self.opt["scale"]
@@ -217,13 +234,19 @@ class DDPModelELVSR(ModelPlain):
             c = c - 1 if self.opt["netG"].get("nonblind_denoising", False) else c
             stride = num_frame_testing - num_frame_overlapping
             d_idx_list = list(range(0, d - num_frame_testing, stride)) + [max(0, d - num_frame_testing)]
-            E = torch.zeros(b, d, c, h * sf, w * sf)
-            W = torch.zeros(b, d, 1, 1, 1)
+
+            d_out = self._n_out(d)
+            E = torch.zeros(b, d_out, c, h * sf, w * sf)
+            W = torch.zeros(b, d_out, 1, 1, 1)
 
             for d_idx in d_idx_list:
                 lq_clip = lq[:, d_idx : d_idx + num_frame_testing, ...]
                 out_clip = self._test_clip(lq_clip)
-                out_clip_mask = torch.ones((b, min(num_frame_testing, d), 1, 1, 1))
+                out_clip_len = out_clip.size(1)
+                out_clip_mask = torch.ones((b, out_clip_len, 1, 1, 1))
+
+                # Map input clip start to output position
+                out_start = d_idx * tsf if tsf > 1 else d_idx
 
                 if not_overlap_border:
                     if d_idx < d_idx_list[-1]:
@@ -233,8 +256,8 @@ class DDPModelELVSR(ModelPlain):
                         out_clip[:, : num_frame_overlapping // 2, ...] *= 0
                         out_clip_mask[:, : num_frame_overlapping // 2, ...] *= 0
 
-                E[:, d_idx : d_idx + num_frame_testing, ...].add_(out_clip)
-                W[:, d_idx : d_idx + num_frame_testing, ...].add_(out_clip_mask)
+                E[:, out_start : out_start + out_clip_len, ...].add_(out_clip)
+                W[:, out_start : out_start + out_clip_len, ...].add_(out_clip_mask)
             output = E.div_(W)
         else:
             window_size = self.opt["val"].get("test_window_size", [6, 8, 8])
@@ -242,7 +265,8 @@ class DDPModelELVSR(ModelPlain):
             d_pad = (d_old // window_size[0] + 1) * window_size[0] - d_old
             lq = torch.cat([lq, torch.flip(lq[:, -d_pad:, ...], [1])], 1)
             output = self._test_clip(lq)
-            output = output[:, :d_old, :, :, :]
+            d_out_old = self._n_out(d_old)
+            output = output[:, :d_out_old, :, :, :]
 
         return output
 
