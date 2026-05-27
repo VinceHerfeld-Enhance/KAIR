@@ -54,7 +54,14 @@ class VideoRecurrentTrainDataset(data.Dataset):
         self.gt_size = opt.get("gt_size", 256)
         self.gt_root, self.lq_root = Path(opt["dataroot_gt"]), Path(opt["dataroot_lq"])
         self.filename_tmpl = opt.get("filename_tmpl", "08d")
+        self.filename_tmpl_lq = opt.get("filename_tmpl_lq", self.filename_tmpl)
+        self.filename_tmpl_gt = opt.get("filename_tmpl_gt", self.filename_tmpl)
+        self.filename_prefix_lq = opt.get("filename_prefix_lq", "")
+        self.filename_prefix_gt = opt.get("filename_prefix_gt", "")
         self.filename_ext = opt.get("filename_ext", "png")
+        self.lq_frame_offset = opt.get("lq_frame_offset", 0)
+        self.crop_min_variance = opt.get("crop_min_variance", 0.0)
+        self.crop_max_retries = opt.get("crop_max_retries", 5)
         self.num_frame = opt["num_frame"]
 
         keys = []
@@ -145,42 +152,71 @@ class VideoRecurrentTrainDataset(data.Dataset):
         if self.random_reverse and random.random() < 0.5:
             neighbor_list.reverse()
 
+        # Determine which GT frame positions to load.
+        # sparse_gt_frames: total number of GT frames to supervise on per sample.
+        # When set, always load the first and last GT frames plus random middle ones.
+        # This avoids loading all (num_frame) HR frames when tsf is large.
+        sparse_gt_frames = self.opt.get("sparse_gt_frames", None)
+        if sparse_gt_frames is not None and sparse_gt_frames > 0 and len(neighbor_list) > sparse_gt_frames:
+            n = len(neighbor_list)
+            fixed_indices = [0, n - 1]
+            n_random = max(0, sparse_gt_frames - 2)
+            middle = [i for i in range(1, n - 1)]
+            rand_middle = sorted(random.sample(middle, min(n_random, len(middle))))
+            gt_indices = sorted(set(fixed_indices + rand_middle))
+        else:
+            gt_indices = list(range(len(neighbor_list)))
+
         # get the neighboring LQ and GT frames
         img_lqs = []
         img_gts = []
-        for neighbor in neighbor_list:
+        img_gt_path = None
+        for t, neighbor in enumerate(neighbor_list):
+            lq_frame = neighbor + self.lq_frame_offset
+            lq_name = f"{self.filename_prefix_lq}{lq_frame:{self.filename_tmpl_lq}}"
+            gt_name = f"{self.filename_prefix_gt}{neighbor:{self.filename_tmpl_gt}}"
             if self.is_lmdb:
-                img_lq_path = f"{clip_name}/{neighbor:{self.filename_tmpl}}"
-                img_gt_path = f"{clip_name}/{neighbor:{self.filename_tmpl}}"
+                img_lq_path = f"{clip_name}/{lq_name}"
             else:
-                img_lq_path = self.lq_root / clip_name / f"{neighbor:{self.filename_tmpl}}.{self.filename_ext}"
-                img_gt_path = self.gt_root / clip_name / f"{neighbor:{self.filename_tmpl}}.{self.filename_ext}"
+                img_lq_path = self.lq_root / clip_name / f"{lq_name}.{self.filename_ext}"
 
             # get LQ
             img_bytes = self.file_client.get(img_lq_path, "lq")
             img_lq = utils_video.imfrombytes(img_bytes, float32=True)
             img_lqs.append(img_lq)
 
-            # get GT
-            img_bytes = self.file_client.get(img_gt_path, "gt")
-            img_gt = utils_video.imfrombytes(img_bytes, float32=True)
-            img_gts.append(img_gt)
+            # get GT only for selected indices
+            if t in gt_indices:
+                if self.is_lmdb:
+                    img_gt_path = f"{clip_name}/{gt_name}"
+                else:
+                    img_gt_path = self.gt_root / clip_name / f"{gt_name}.{self.filename_ext}"
+                img_bytes = self.file_client.get(img_gt_path, "gt")
+                img_gt = utils_video.imfrombytes(img_bytes, float32=True)
+                img_gts.append(img_gt)
 
         # randomly crop
-        img_gts, img_lqs = utils_video.paired_random_crop(img_gts, img_lqs, self.gt_size, self.scale, img_gt_path)
+        img_gts, img_lqs = utils_video.paired_random_crop(
+            img_gts, img_lqs, self.gt_size, self.scale, img_gt_path,
+            min_variance=self.crop_min_variance, max_retries=self.crop_max_retries)
 
         # augmentation - flip, rotate
+        n_lq = len(img_lqs)
+        n_gt = len(img_gts)
         img_lqs.extend(img_gts)
         img_results = utils_video.augment(img_lqs, self.opt["use_hflip"], self.opt["use_rot"])
 
         img_results = utils_video.img2tensor(img_results)
-        img_gts = torch.stack(img_results[len(img_lqs) // 2 :], dim=0)
-        img_lqs = torch.stack(img_results[: len(img_lqs) // 2], dim=0)
+        img_gts = torch.stack(img_results[n_lq:], dim=0)
+        img_lqs = torch.stack(img_results[:n_lq], dim=0)
 
         # img_lqs: (t, c, h, w)
-        # img_gts: (t, c, h, w)
+        # img_gts: (k, c, h, w)  where k <= t (sparse) or k == t (full)
         # key: str
-        return {"L": img_lqs, "H": img_gts, "key": key}
+        result = {"L": img_lqs, "H": img_gts, "key": key}
+        if n_gt < n_lq:
+            result["gt_indices"] = torch.tensor(gt_indices, dtype=torch.long)
+        return result
 
     def __len__(self):
         return len(self.keys)
