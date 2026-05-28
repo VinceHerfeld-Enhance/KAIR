@@ -137,14 +137,24 @@ class ModelELVSR(ModelPlain):
     # ----------------------------------------
     def _init_raft(self):
         """Load a frozen RAFT-Large for on-the-fly flow pseudo-GT."""
-        from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+        raft_checkpoint = self.opt_train.get("raft_checkpoint", None)
+        if raft_checkpoint:
+            from torchvision.models.optical_flow import raft_large
 
-        self.raft_model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False)
+            self.raft_model = raft_large(weights=None, progress=False)
+            state_dict = torch.load(raft_checkpoint, map_location="cpu", weights_only=True)
+            self.raft_model.load_state_dict(state_dict)
+            print(f"[ModelELVSR] Frozen RAFT-Large loaded from {raft_checkpoint}")
+        else:
+            from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+
+            self.raft_model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False)
+            print(f"[ModelELVSR] Frozen RAFT-Large loaded from torchvision defaults")
         self.raft_model.eval()
         self.raft_model.to(self.device)
         for p in self.raft_model.parameters():
             p.requires_grad_(False)
-        print(f"[ModelELVSR] Frozen RAFT-Large loaded for flow supervision (lambda={self.lambda_flow})")
+        print(f"[ModelELVSR] Flow supervision lambda={self.lambda_flow}")
 
     @torch.no_grad()
     def _raft_flow(self, img1: torch.Tensor, img2: torch.Tensor) -> torch.Tensor:
