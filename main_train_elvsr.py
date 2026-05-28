@@ -260,7 +260,11 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
             # -------------------------------
             # 2) feed patch pairs
             # -------------------------------
-            if tsf > 1:
+            # Only subsample LR here if the dataset did NOT already do it.
+            # When the dataset config contains "tsf", the dataset returns
+            # pre-subsampled LR frames; subsampling again would be wrong.
+            dataset_handles_tsf = opt["datasets"]["train"].get("tsf", 1) not in (None, 1)
+            if tsf > 1 and not dataset_handles_tsf:
                 # Temporally subsample LR: keep every tsf-th frame
                 # H stays full so loss covers all frames
                 train_data["L"] = train_data["L"][:, ::tsf]

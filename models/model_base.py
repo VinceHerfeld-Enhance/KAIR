@@ -61,7 +61,7 @@ class ModelBase:
 
     def update_learning_rate(self, n):
         for scheduler in self.schedulers:
-            scheduler.step(n)
+            scheduler.step()
 
     def current_learning_rate(self):
         return self.schedulers[0].get_lr()[0]
