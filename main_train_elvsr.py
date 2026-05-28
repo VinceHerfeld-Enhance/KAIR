@@ -162,8 +162,12 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     # temporal scale factor (TSR)
     # ----------------------------------------
     tsf = int(opt["netG"].get("tsf", 1)) if opt["netG"] is not None else 1
+    n_interp_samples = int(opt["train"]["n_interp_samples"]) if opt["train"]["n_interp_samples"] else None
     if tsf > 1 and opt["rank"] == 0:
         logger.info(f"Temporal super-resolution enabled: tsf={tsf}")
+        if n_interp_samples is not None:
+            assert 1 <= n_interp_samples < tsf, f"n_interp_samples ({n_interp_samples}) must be in [1, tsf-1={tsf - 1}]"
+            logger.info(f"  Random temporal sampling: {n_interp_samples}/{tsf - 1} intermediate steps per gap")
         num_frame = opt["datasets"]["train"]["num_frame"]
         assert (num_frame - 1) % tsf == 0, (
             f"num_frame ({num_frame}) must satisfy (num_frame - 1) % tsf == 0 "
@@ -261,6 +265,25 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                 # H stays full so loss covers all frames
                 train_data["L"] = train_data["L"][:, ::tsf]
             model.feed_data(train_data)
+
+            # -------------------------------
+            # 2b) random temporal step sampling
+            # -------------------------------
+            if tsf > 1 and n_interp_samples is not None:
+                # Sample which intermediate steps to generate this iteration
+                interp_steps = sorted(random.sample(range(1, tsf), n_interp_samples))
+                model.interp_steps = interp_steps
+
+                # Select matching GT frames: input frames + sampled intermediates
+                T_in = model.L.size(1)
+                gt_select = []
+                for fi in range(T_in):
+                    gt_select.append(fi * tsf)  # input frame position in full GT
+                    if fi < T_in - 1:
+                        for k in interp_steps:
+                            gt_select.append(fi * tsf + k)
+                model.H = model.H[:, gt_select]
+                model.gt_indices = None  # output and GT are now 1:1 aligned
 
             # -------------------------------
             # 3) optimize parameters

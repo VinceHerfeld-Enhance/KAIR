@@ -173,6 +173,16 @@ class ModelPlain(ModelBase):
                     self.opt_train["G_scheduler_eta_min"],
                 )
             )
+        elif self.opt_train["G_scheduler_type"] == "CosineAnnealingRestartLR":
+            from basicsr.models.lr_scheduler import CosineAnnealingRestartLR
+            self.schedulers.append(
+                CosineAnnealingRestartLR(
+                    self.G_optimizer,
+                    periods=self.opt_train["G_scheduler_periods"],
+                    restart_weights=self.opt_train["G_scheduler_restart_weights"],
+                    eta_min=self.opt_train["G_scheduler_eta_min"],
+                )
+            )
         else:
             raise NotImplementedError
 

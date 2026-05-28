@@ -24,6 +24,12 @@ class ModelELVSR(ModelPlain):
         if self.tsf > 1 and self.lambda_flow > 0:
             self._init_raft()
 
+        # ---- Frozen V-JEPA for video perceptual loss ----
+        self.lambda_vjepa = float(self.opt_train.get("lambda_vjepa", 0.0))
+        self.vjepa_loss = None
+        if self.lambda_vjepa > 0:
+            self._init_vjepa()
+
     # ----------------------------------------
     # feed L/H data, capturing sparse GT indices when present
     # ----------------------------------------
@@ -38,6 +44,18 @@ class ModelELVSR(ModelPlain):
             self.H_full = data["H_full"].to(self.device)
         else:
             self.H_full = self.H  # when no sparse GT, H is the full sequence
+
+        # interp_steps to be set externally before optimize_parameters
+        self.interp_steps = None
+
+    # ----------------------------------------
+    # feed L to netG, with optional interp_steps
+    # ----------------------------------------
+    def netG_forward(self):
+        if self.interp_steps is not None:
+            self.E = self.netG(self.L, interp_steps=self.interp_steps)
+        else:
+            self.E = self.netG(self.L)
 
     # ----------------------------------------
     # compute loss against sparse or full GT
@@ -60,7 +78,59 @@ class ModelELVSR(ModelPlain):
             self.log_dict["flow_loss"] = flow_loss.item()
             G_loss = G_loss + flow_loss
 
+        # ---- V-JEPA video perceptual loss ----
+        vjepa_loss = self._compute_vjepa_loss()
+        if vjepa_loss is not None:
+            self.log_dict["vjepa_loss"] = vjepa_loss.item()
+            G_loss = G_loss + vjepa_loss
+
         return G_loss
+
+    # ----------------------------------------
+    # Frozen V-JEPA for video perceptual loss
+    # ----------------------------------------
+    def _init_vjepa(self):
+        """Load frozen V-JEPA encoder for video perceptual loss."""
+        from models.loss_vjepa import VJEPAPerceptualLoss
+
+        model_name = self.opt_train.get("vjepa_model", "vit_large")
+        checkpoint = self.opt_train.get("vjepa_checkpoint", None)
+        feature_layers = self.opt_train.get("vjepa_feature_layers", None)
+        weights = self.opt_train.get("vjepa_weights", None)
+        lossfn_type = self.opt_train.get("vjepa_lossfn_type", "l1")
+        patch_size = tuple(self.opt_train.get("vjepa_patch_size", [2, 16, 16]))
+        crop_size = int(self.opt_train.get("vjepa_crop_size", 224))
+        num_frames = int(self.opt_train.get("vjepa_num_frames", 16))
+
+        self.vjepa_loss = VJEPAPerceptualLoss(
+            model_name=model_name,
+            checkpoint_path=checkpoint,
+            feature_layers=feature_layers,
+            weights=weights,
+            lossfn_type=lossfn_type,
+            patch_size=patch_size,
+            crop_size=crop_size,
+            num_frames=num_frames,
+        ).to(self.device)
+        print(f"[ModelELVSR] V-JEPA perceptual loss loaded (model={model_name}, lambda={self.lambda_vjepa})")
+
+    def _compute_vjepa_loss(self):
+        """Compute V-JEPA perceptual loss between predicted and GT video."""
+        if self.vjepa_loss is None or self.lambda_vjepa <= 0:
+            return None
+
+        # Use full GT sequence for perceptual comparison
+        pred = self.E  # (B, T, C, H, W)
+        gt = self.H_full if hasattr(self, "H_full") else self.H
+
+        # When sparse GT: compare only at GT frame positions
+        if self.gt_indices is not None:
+            B, K = self.gt_indices.shape
+            b_idx = torch.arange(B, device=self.device).unsqueeze(1).expand(B, K)
+            pred = pred[b_idx, self.gt_indices]  # (B, K, C, H, W)
+            gt = self.H  # already (B, K, C, H, W)
+
+        return self.lambda_vjepa * self.vjepa_loss(pred, gt)
 
     # ----------------------------------------
     # Frozen RAFT for flow pseudo-GT
@@ -150,7 +220,12 @@ class ModelELVSR(ModelPlain):
             gt_right_hr = gt[:, gt_right_idx]  # [B, 3, H_hr, W_hr]
 
             for k_idx, flow_dict in enumerate(gap_flows):
-                k = k_idx + 1  # sub-step index (1 .. tsf-1)
+                # When interp_steps is set, gap_flows only contains entries
+                # for the sampled steps, so map k_idx to the actual sub-step.
+                if self.interp_steps is not None:
+                    k = self.interp_steps[k_idx]
+                else:
+                    k = k_idx + 1  # sub-step index (1 .. tsf-1)
 
                 # GT intermediate frame at native HR resolution
                 gt_mid_idx = gt_left_idx + k
