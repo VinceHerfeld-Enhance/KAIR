@@ -63,6 +63,7 @@ class VideoRecurrentTrainDataset(data.Dataset):
         self.crop_min_variance = opt.get("crop_min_variance", 0.0)
         self.crop_max_retries = opt.get("crop_max_retries", 5)
         self.num_frame = opt["num_frame"]
+        self.tsf = int(opt.get("tsf", 1))  # temporal scale factor: only load every tsf-th LQ frame
 
         keys = []
         total_num_frames = []  # some clips may not have 100 frames
@@ -167,6 +168,12 @@ class VideoRecurrentTrainDataset(data.Dataset):
         else:
             gt_indices = list(range(len(neighbor_list)))
 
+        # Determine which LQ frames to load (subsample by tsf for temporal SR)
+        if self.tsf > 1:
+            lq_indices = set(range(0, len(neighbor_list), self.tsf))
+        else:
+            lq_indices = set(range(len(neighbor_list)))
+
         # get the neighboring LQ and GT frames
         img_lqs = []
         img_gts = []
@@ -175,15 +182,16 @@ class VideoRecurrentTrainDataset(data.Dataset):
             lq_frame = neighbor + self.lq_frame_offset
             lq_name = f"{self.filename_prefix_lq}{lq_frame:{self.filename_tmpl_lq}}"
             gt_name = f"{self.filename_prefix_gt}{neighbor:{self.filename_tmpl_gt}}"
-            if self.is_lmdb:
-                img_lq_path = f"{clip_name}/{lq_name}"
-            else:
-                img_lq_path = self.lq_root / clip_name / f"{lq_name}.{self.filename_ext}"
 
-            # get LQ
-            img_bytes = self.file_client.get(img_lq_path, "lq")
-            img_lq = utils_video.imfrombytes(img_bytes, float32=True)
-            img_lqs.append(img_lq)
+            # get LQ only for temporally subsampled indices
+            if t in lq_indices:
+                if self.is_lmdb:
+                    img_lq_path = f"{clip_name}/{lq_name}"
+                else:
+                    img_lq_path = self.lq_root / clip_name / f"{lq_name}.{self.filename_ext}"
+                img_bytes = self.file_client.get(img_lq_path, "lq")
+                img_lq = utils_video.imfrombytes(img_bytes, float32=True)
+                img_lqs.append(img_lq)
 
             # get GT only for selected indices
             if t in gt_indices:
@@ -197,8 +205,14 @@ class VideoRecurrentTrainDataset(data.Dataset):
 
         # randomly crop
         img_gts, img_lqs = utils_video.paired_random_crop(
-            img_gts, img_lqs, self.gt_size, self.scale, img_gt_path,
-            min_variance=self.crop_min_variance, max_retries=self.crop_max_retries)
+            img_gts,
+            img_lqs,
+            self.gt_size,
+            self.scale,
+            img_gt_path,
+            min_variance=self.crop_min_variance,
+            max_retries=self.crop_max_retries,
+        )
 
         # augmentation - flip, rotate
         n_lq = len(img_lqs)
@@ -210,11 +224,12 @@ class VideoRecurrentTrainDataset(data.Dataset):
         img_gts = torch.stack(img_results[n_lq:], dim=0)
         img_lqs = torch.stack(img_results[:n_lq], dim=0)
 
-        # img_lqs: (t, c, h, w)
-        # img_gts: (k, c, h, w)  where k <= t (sparse) or k == t (full)
+        # img_lqs: (t_lq, c, h, w)  — temporally subsampled if tsf > 1
+        # img_gts: (k, c, h, w)  where k <= num_frame (sparse) or k == num_frame (full)
         # key: str
+        n_out = (n_lq - 1) * self.tsf + 1 if self.tsf > 1 else n_lq
         result = {"L": img_lqs, "H": img_gts, "key": key}
-        if n_gt < n_lq:
+        if n_gt < n_out:
             result["gt_indices"] = torch.tensor(gt_indices, dtype=torch.long)
         return result
 
