@@ -243,6 +243,7 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     # Step--4 (main training)
     # ----------------------------------------
     """
+    saved_fixed = False  # avoid saving the same fixed test frames multiple times
     total_iter = opt["train"]["total_iter"]
     epoch = 0
     while current_step < total_iter:  # keep running
@@ -268,26 +269,48 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                 # Temporally subsample LR: keep every tsf-th frame
                 # H stays full so loss covers all frames
                 train_data["L"] = train_data["L"][:, ::tsf]
-            model.feed_data(train_data)
 
             # -------------------------------
-            # 2b) random temporal step sampling
+            # 2b) random temporal step sampling — BEFORE feed_data to avoid
+            #     loading unused GT frames onto GPU.
             # -------------------------------
             if tsf > 1 and n_interp_samples is not None:
-                # Sample which intermediate steps to generate this iteration
-                interp_steps = sorted(random.sample(range(1, tsf), n_interp_samples))
-                model.interp_steps = interp_steps
+                # Sample a DIFFERENT k per gap for tau diversity within each
+                # iteration. This gives T_in-1 different tau values instead of
+                # repeating the same one across all gaps.
+                T_in = train_data["L"].size(1)
+                n_gaps = T_in - 1
+                interp_steps_per_gap = {}
+                for gap_idx in range(n_gaps):
+                    interp_steps_per_gap[gap_idx] = sorted(random.sample(range(1, tsf), n_interp_samples))
 
-                # Select matching GT frames: input frames + sampled intermediates
-                T_in = model.L.size(1)
-                gt_select = []
+                # Determine which GT frame indices are needed:
+                #   - input-aligned positions (every tsf-th)
+                #   - sampled intermediate positions for pixel loss (per-gap)
+                gt_indices_set = set()
                 for fi in range(T_in):
-                    gt_select.append(fi * tsf)  # input frame position in full GT
-                    if fi < T_in - 1:
-                        for k in interp_steps:
-                            gt_select.append(fi * tsf + k)
-                model.H = model.H[:, gt_select]
-                model.gt_indices = None  # output and GT are now 1:1 aligned
+                    gt_indices_set.add(fi * tsf)  # input frame
+                for gap_idx in range(n_gaps):
+                    for k in interp_steps_per_gap[gap_idx]:
+                        gt_indices_set.add(gap_idx * tsf + k)  # sampled mid
+                gt_select = sorted(gt_indices_set)
+
+                # Subset GT on CPU before sending to GPU
+                train_data["H"] = train_data["H"][:, gt_select]
+                # Store index mapping so RAFT can find the right frames in H_full
+                train_data["H_full_indices"] = gt_select
+            else:
+                interp_steps_per_gap = None
+
+            model.feed_data(train_data)
+
+            # Set interp_steps and gt_indices AFTER feed_data (which resets them)
+            if tsf > 1 and n_interp_samples is not None:
+                model.interp_steps = interp_steps_per_gap
+                # With interp_steps active, model output is already 1:1 with gt_select — no gt_indices needed
+                model.gt_indices = None
+            else:
+                model.interp_steps = None
 
             # -------------------------------
             # 3) optimize parameters
@@ -373,6 +396,36 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                     # Trim GT to match output length.
                     if gt is not None and gt.shape[0] > output.shape[0]:
                         gt = gt[: output.shape[0]]
+
+                    # -------------------------------
+                    # debug: save L / E / H frames for first test video
+                    # -------------------------------
+                    if idx == 1 and opt["train"]["checkpoint_debug_frames"] and opt["rank"] == 0:
+                        debug_val_dir = os.path.join(
+                            opt["path"]["images"], "debug_val", f"iter_{current_step:08d}", folder[0]
+                        )
+                        lr_frames = visuals["L"]  # [T_lq, C, H, W]
+
+                        modalities = [("E", output)]
+                        if not saved_fixed:
+                            modalities.insert(0, ("L", lr_frames))
+                            modalities.append(("H", gt))
+                            saved_fixed = True
+                        for key, frames in modalities:
+                            if frames is None:
+                                continue
+                            out_dir = os.path.join(debug_val_dir, key)
+                            os.makedirs(out_dir, exist_ok=True)
+                            for fi in range(frames.shape[0]):
+                                fr = frames[fi].clamp_(0, 1).numpy()
+                                if fr.ndim == 3:
+                                    fr = np.transpose(fr[[2, 1, 0], :, :], (1, 2, 0))
+                                fr = (fr * 255.0).round().astype(np.uint8)
+                                cv2.imwrite(os.path.join(out_dir, f"{fi:05d}.png"), fr)
+                        logger.info(
+                            f"Debug val frames saved: {debug_val_dir}/ "
+                            f"(L={lr_frames.shape[0]}, E={output.shape[0]}, H={gt.shape[0] if gt is not None else 0})"
+                        )
 
                     test_results_folder = OrderedDict()
                     test_results_folder["psnr"] = []

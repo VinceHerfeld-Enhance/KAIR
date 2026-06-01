@@ -450,7 +450,8 @@ def define_G(opt):
             refine_features=opt_net.get("refine_features", False),
             refine_guidance_mode=opt_net.get("refine_guidance_mode", "occlusion"),
             flow_refine_feature_source=opt_net.get("flow_refine_feature_source", "reconstruction"),
-            learned_surrogate_blend=opt_net.get("learned_surrogate_blend", True),
+            splatting_mode=opt_net.get("splatting_mode", "simple"),
+            learned_surrogate_blend=opt_net.get("learned_surrogate_blend", False),
             learned_interp_flow=opt_net.get("learned_interp_flow", True),
             interp_flow_max_residue=opt_net.get("interp_flow_max_residue", 5.0),
         )

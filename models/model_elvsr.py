@@ -20,9 +20,23 @@ class ModelELVSR(ModelPlain):
 
         # ---- Frozen RAFT for intermediate flow supervision ----
         self.lambda_flow = float(self.opt_train.get("lambda_flow_supervision", 0.0))
+        # Linear decay: lambda_flow decays from its initial value to 0 over
+        # ``flow_loss_decay_steps`` training steps.  Set to 0 (default) to
+        # keep the weight constant.  This lets the corrector bootstrap from
+        # RAFT early on but specialise for VSR later.
+        self.flow_loss_decay_steps = int(self.opt_train.get("flow_loss_decay_steps", 0))
+        # Teacher-forcing of the interp_flow_net with RAFT pseudo-GT during
+        # early training. ``teacher_flow_p0`` is the per-step probability of
+        # replacing the corrector output with the RAFT flow at step 0; the
+        # probability decays linearly to 0 over ``teacher_flow_decay_steps``.
+        self.teacher_flow_p0 = float(self.opt_train.get("teacher_flow_p0", 0.0))
+        self.teacher_flow_decay_steps = int(self.opt_train.get("teacher_flow_decay_steps", 20000))
         self.raft_model = None
-        if self.tsf > 1 and self.lambda_flow > 0:
+        if self.tsf > 1 and (self.lambda_flow > 0 or self.teacher_flow_p0 > 0):
             self._init_raft()
+        # Per-step caches populated in optimize_parameters
+        self._current_pseudo_gt = None
+        self._use_teacher_this_step = False
 
         # ---- Frozen V-JEPA for video perceptual loss ----
         self.lambda_vjepa = float(self.opt_train.get("lambda_vjepa", 0.0))
@@ -39,23 +53,32 @@ class ModelELVSR(ModelPlain):
             self.gt_indices = data["gt_indices"].to(self.device)  # (B, K)
         else:
             self.gt_indices = None
-        # Store full GT sequence for flow supervision (before any sparse indexing)
+        # Store full GT sequence for flow supervision (before any sparse indexing).
+        # When the training loop pre-subsets GT, H already contains only the
+        # needed frames and H_full_indices maps positions back to the original
+        # full-sequence indexing. H_full == H in that case (same tensor).
         if "H_full" in data:
             self.H_full = data["H_full"].to(self.device)
         else:
             self.H_full = self.H  # when no sparse GT, H is the full sequence
+        # Mapping from H_full positions → original absolute GT frame indices.
+        # Used by _compute_pseudo_gt_flows to locate bracket/mid frames.
+        self._h_full_indices = data.get("H_full_indices", None)
 
         # interp_steps to be set externally before optimize_parameters
         self.interp_steps = None
 
     # ----------------------------------------
-    # feed L to netG, with optional interp_steps
+    # feed L to netG, with optional interp_steps and oracle teacher flows
     # ----------------------------------------
     def netG_forward(self):
+        teacher = self._current_pseudo_gt if self._use_teacher_this_step else None
+        kwargs = {}
         if self.interp_steps is not None:
-            self.E = self.netG(self.L, interp_steps=self.interp_steps)
-        else:
-            self.E = self.netG(self.L)
+            kwargs["interp_steps"] = self.interp_steps
+        if teacher is not None:
+            kwargs["teacher_flows"] = teacher
+        self.E = self.netG(self.L, **kwargs)
 
     # ----------------------------------------
     # compute loss against sparse or full GT
@@ -151,9 +174,9 @@ class ModelELVSR(ModelPlain):
             self.raft_model = raft_large(weights=Raft_Large_Weights.DEFAULT, progress=False)
             print(f"[ModelELVSR] Frozen RAFT-Large loaded from torchvision defaults")
         self.raft_model.eval()
-        self.raft_model.to(self.device)
         for p in self.raft_model.parameters():
             p.requires_grad_(False)
+        self.raft_model.to(self.device)
         print(f"[ModelELVSR] Flow supervision lambda={self.lambda_flow}")
 
     @torch.no_grad()
@@ -182,101 +205,153 @@ class ModelELVSR(ModelPlain):
 
         return flow.permute(0, 2, 3, 1)  # [B, H, W, 2]
 
-    def _compute_flow_supervision_loss(self):
-        """Compute L1 loss between corrected intermediate flows and RAFT pseudo-GT.
+    def _raft_flow_lr(self, img1_hr, img2_hr, h_lr, w_lr):
+        """RAFT(img1, img2) at HR, downsampled+scaled to LR grid."""
+        flow_hr = self._raft_flow(img1_hr, img2_hr)  # [B, H_hr, W_hr, 2]
+        scale_h = h_lr / flow_hr.shape[1]
+        scale_w = w_lr / flow_hr.shape[2]
+        flow_lr = F.interpolate(
+            flow_hr.permute(0, 3, 1, 2), size=(h_lr, w_lr), mode="bilinear", align_corners=False
+        ).permute(0, 2, 3, 1)
+        flow_lr[..., 0] *= scale_w
+        flow_lr[..., 1] *= scale_h
+        return flow_lr
 
-        The corrector predicts flows at LR resolution (virtual -> left bracket,
-        virtual -> right bracket).  We run RAFT on GT frames at their native HR
-        resolution (where RAFT is most accurate), then downscale the resulting
-        flow to match the corrector's LR grid.
+    @torch.no_grad()
+    def _compute_pseudo_gt_flows(self):
+        """Pre-compute RAFT pseudo-GT flows for all (gap, sub-step) pairs.
 
-        For each gap between input frame i and i+1, and each sub-step k:
-            raft_v2l = downsample(RAFT(gt_mid_hr, gt_left_hr))
-            raft_v2r = downsample(RAFT(gt_mid_hr, gt_right_hr))
-            loss += L1(corrected_v2l, raft_v2l) + L1(corrected_v2r, raft_v2r)
+        Returns a nested dict ``{gap_idx: {k: {'v2l','v2r','l2v','r2v'}}}`` at
+        LR resolution, ready to be fed to ``netG(..., teacher_flows=...)`` and
+        reused by the flow-supervision loss to avoid duplicate RAFT calls.
+        Returns ``None`` if RAFT is not available.
 
-        Returns:
-            Weighted flow loss scalar, or None if not applicable.
+        The four directional RAFT calls per ``(gap, k)`` are batched into a
+        single forward pass (B*4) and the result is split + downsampled in
+        one shot.
+
+        When the training loop pre-subsets GT (H_full_indices is set), frame
+        positions are looked up via that index map instead of assuming H_full
+        contains a contiguous full-length sequence.
         """
-        if self.raft_model is None or self.lambda_flow <= 0:
+        if self.raft_model is None or self.tsf <= 1:
             return None
+        gt = self.H_full
+        h_lr, w_lr = self.L.shape[-2:]
+        T_in = self.L.shape[1]
+        # interp_steps may be a per-gap dict or a flat list
+        default_sub_steps = list(range(1, self.tsf))
 
+        # Build absolute-index → H_full-position lookup.
+        if self._h_full_indices is not None:
+            idx_map = {abs_idx: pos for pos, abs_idx in enumerate(self._h_full_indices)}
+        else:
+            idx_map = None
+
+        def _get_frame(abs_idx):
+            """Fetch a GT frame by its absolute index in the original sequence."""
+            if idx_map is not None:
+                pos = idx_map.get(abs_idx)
+                if pos is None:
+                    return None
+                return gt[:, pos]
+            if abs_idx >= gt.shape[1]:
+                return None
+            return gt[:, abs_idx]
+
+        out = {}
+        for gap_idx in range(T_in - 1):
+            # Resolve sub-steps for this gap
+            if isinstance(self.interp_steps, dict):
+                sub_steps = self.interp_steps.get(gap_idx, default_sub_steps)
+            elif self.interp_steps is not None:
+                sub_steps = self.interp_steps
+            else:
+                sub_steps = default_sub_steps
+            gt_left_idx = gap_idx * self.tsf
+            gt_right_idx = (gap_idx + 1) * self.tsf
+            gt_left_hr = _get_frame(gt_left_idx)
+            gt_right_hr = _get_frame(gt_right_idx)
+            if gt_left_hr is None or gt_right_hr is None:
+                continue
+            per_k = {}
+            for k in sub_steps:
+                gt_mid_idx = gt_left_idx + k
+                gt_mid_hr = _get_frame(gt_mid_idx)
+                if gt_mid_hr is None:
+                    continue
+                # Batch all 4 directional RAFT calls into a single forward pass
+                # to reduce kernel launch overhead (4×B at LR-GT resolution is fine).
+                src = torch.cat([gt_mid_hr, gt_mid_hr, gt_left_hr, gt_right_hr], dim=0)
+                dst = torch.cat([gt_left_hr, gt_right_hr, gt_mid_hr, gt_mid_hr], dim=0)
+                flow_hr_4 = self._raft_flow(src, dst)  # [4B, H, W, 2]
+                scale_h = h_lr / flow_hr_4.shape[1]
+                scale_w = w_lr / flow_hr_4.shape[2]
+                flow_lr_4 = F.interpolate(
+                    flow_hr_4.permute(0, 3, 1, 2), size=(h_lr, w_lr), mode="bilinear", align_corners=False
+                ).permute(0, 2, 3, 1)
+                flow_lr_4[..., 0] *= scale_w
+                flow_lr_4[..., 1] *= scale_h
+                B = gt_mid_hr.shape[0]
+                v2l, v2r, l2v, r2v = flow_lr_4.split(B, dim=0)
+                per_k[k] = {"v2l": v2l, "v2r": v2r, "l2v": l2v, "r2v": r2v}
+            if per_k:
+                out[gap_idx] = per_k
+        return out
+
+    def _teacher_prob(self, current_step):
+        """Linearly decay teacher-forcing probability from p0 to 0."""
+        if self.teacher_flow_p0 <= 0 or self.teacher_flow_decay_steps <= 0:
+            return 0.0
+        frac = 1.0 - current_step / float(self.teacher_flow_decay_steps)
+        return max(0.0, self.teacher_flow_p0 * frac)
+
+    def _flow_loss_weight(self, current_step):
+        """Return the (possibly decayed) flow-supervision weight."""
+        if self.lambda_flow <= 0:
+            return 0.0
+        if self.flow_loss_decay_steps <= 0:
+            return self.lambda_flow  # constant
+        frac = 1.0 - current_step / float(self.flow_loss_decay_steps)
+        return max(0.0, self.lambda_flow * frac)
+
+    def _compute_flow_supervision_loss(self):
+        """L1 loss between predicted corrected flows and RAFT pseudo-GT (v2l, v2r)."""
+        lam = self._current_flow_loss_weight
+        if self.raft_model is None or lam <= 0:
+            return None
         net = self.get_bare_model(self.netG)
         if not hasattr(net, "_aux_interp_flows") or not net._aux_interp_flows:
             return None
-
-        aux_flows = net._aux_interp_flows  # list of per-gap lists of dicts
-        tsf = self.tsf
-        # H_full is [B, T_full, C, H_hr, W_hr] — the full GT sequence
-        gt = self.H_full
-        B, T_full = gt.shape[:2]
-
-        # Get LR spatial resolution from corrector flows
-        sample_flow = aux_flows[0][0]["v2l"]  # [B, H_lr, W_lr, 2]
-        h_lr, w_lr = sample_flow.shape[1], sample_flow.shape[2]
-
-        total_loss = sample_flow.new_tensor(0.0)
-        n_terms = 0
-
-        for gap_idx, gap_flows in enumerate(aux_flows):
-            # GT indices for left/right bracket frames
-            gt_left_idx = gap_idx * tsf
-            gt_right_idx = (gap_idx + 1) * tsf
-
-            if gt_right_idx >= T_full:
-                continue
-
-            gt_left_hr = gt[:, gt_left_idx]  # [B, 3, H_hr, W_hr]
-            gt_right_hr = gt[:, gt_right_idx]  # [B, 3, H_hr, W_hr]
-
-            for k_idx, flow_dict in enumerate(gap_flows):
-                # When interp_steps is set, gap_flows only contains entries
-                # for the sampled steps, so map k_idx to the actual sub-step.
-                if self.interp_steps is not None:
-                    k = self.interp_steps[k_idx]
-                else:
-                    k = k_idx + 1  # sub-step index (1 .. tsf-1)
-
-                # GT intermediate frame at native HR resolution
-                gt_mid_idx = gt_left_idx + k
-                if gt_mid_idx >= T_full:
-                    continue
-                gt_mid_hr = gt[:, gt_mid_idx]
-
-                # RAFT at HR, then downscale flow to LR
-                raft_v2l_hr = self._raft_flow(gt_mid_hr, gt_left_hr)  # [B, H_hr, W_hr, 2]
-                raft_v2r_hr = self._raft_flow(gt_mid_hr, gt_right_hr)
-
-                # Downscale flow to LR grid: resize spatially and scale magnitudes
-                scale_h = h_lr / raft_v2l_hr.shape[1]
-                scale_w = w_lr / raft_v2l_hr.shape[2]
-                raft_v2l = F.interpolate(
-                    raft_v2l_hr.permute(0, 3, 1, 2),
-                    size=(h_lr, w_lr),
-                    mode="bilinear",
-                    align_corners=False,
-                ).permute(0, 2, 3, 1)
-                raft_v2l[..., 0] *= scale_w
-                raft_v2l[..., 1] *= scale_h
-                raft_v2r = F.interpolate(
-                    raft_v2r_hr.permute(0, 3, 1, 2),
-                    size=(h_lr, w_lr),
-                    mode="bilinear",
-                    align_corners=False,
-                ).permute(0, 2, 3, 1)
-                raft_v2r[..., 0] *= scale_w
-                raft_v2r[..., 1] *= scale_h
-
-                pred_v2l = flow_dict["v2l"]
-                pred_v2r = flow_dict["v2r"]
-
-                total_loss = total_loss + F.l1_loss(pred_v2l, raft_v2l) + F.l1_loss(pred_v2r, raft_v2r)
-                n_terms += 2
-
-        if n_terms == 0:
+        pseudo = self._current_pseudo_gt
+        if pseudo is None:
             return None
 
-        return self.lambda_flow * total_loss / n_terms
+        aux_flows = net._aux_interp_flows  # list of per-gap lists of dicts
+        total = self.L.new_tensor(0.0)
+        n_terms = 0
+        for gap_idx, gap_flows in enumerate(aux_flows):
+            if gap_idx not in pseudo:
+                continue
+            per_k = pseudo[gap_idx]
+            for k_idx, flow_dict in enumerate(gap_flows):
+                # Resolve k from per-gap dict or flat list
+                if isinstance(self.interp_steps, dict):
+                    gap_steps = self.interp_steps.get(gap_idx, list(range(1, self.tsf)))
+                    k = gap_steps[k_idx] if k_idx < len(gap_steps) else k_idx + 1
+                elif self.interp_steps is not None:
+                    k = self.interp_steps[k_idx]
+                else:
+                    k = k_idx + 1
+                if k not in per_k:
+                    continue
+                gt_flows = per_k[k]
+                total = total + F.l1_loss(flow_dict["v2l"], gt_flows["v2l"])
+                total = total + F.l1_loss(flow_dict["v2r"], gt_flows["v2r"])
+                n_terms += 2
+        if n_terms == 0:
+            return None
+        return lam * total / n_terms
 
     # ----------------------------------------
     # PSNR logging, aligned with sparse GT when present
@@ -378,6 +453,24 @@ class ModelELVSR(ModelPlain):
             elif current_step == self.fix_iter:
                 print(f"Train all the parameters from {self.fix_iter} iters.")
                 self.netG.requires_grad_(True)
+
+        # Pre-compute RAFT pseudo-GT once and reuse it for (a) optional
+        # teacher-forcing of the corrector and (b) the flow supervision loss.
+        # Skip entirely when neither client needs it (e.g. after teacher decay
+        # if lambda_flow==0).
+        self._current_pseudo_gt = None
+        self._use_teacher_this_step = False
+        self._current_flow_loss_weight = self._flow_loss_weight(current_step) if self.raft_model is not None else 0.0
+        p = self._teacher_prob(current_step) if self.raft_model is not None else 0.0
+        if self.raft_model is not None and self.tsf > 1 and (self._current_flow_loss_weight > 0 or p > 0):
+            self._current_pseudo_gt = self._compute_pseudo_gt_flows()
+            if p > 0 and torch.rand(()).item() < p:
+                self._use_teacher_this_step = True
+                self.log_dict["teacher_forced"] = 1.0
+            else:
+                self.log_dict["teacher_forced"] = 0.0
+            self.log_dict["teacher_prob"] = p
+            self.log_dict["flow_loss_weight"] = self._current_flow_loss_weight
 
         super(ModelELVSR, self).optimize_parameters(current_step)
 
