@@ -453,7 +453,7 @@ def define_G(opt):
             splatting_mode=opt_net.get("splatting_mode", "simple"),
             learned_surrogate_blend=opt_net.get("learned_surrogate_blend", False),
             interp_flow_max_residue=opt_net.get("interp_flow_max_residue", 5.0),
-            interp_flow_residual_mode=opt_net.get("interp_flow_residual_mode", "learned"),
+            interp_flow_mode=opt_net.get("interp_flow_mode", "learned"),
             interp_flow_residual_base=opt_net.get("interp_flow_residual_base", "linear"),
             interp_flow_context_radius=opt_net.get("interp_flow_context_radius", 0),
             include_surrogate_in_temporal_burst=opt_net.get("include_surrogate_in_temporal_burst", False),
