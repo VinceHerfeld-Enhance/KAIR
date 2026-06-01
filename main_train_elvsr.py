@@ -513,6 +513,108 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
 
     logger.info("Finish training.")
     model.save(current_step)
+
+    # Final validation at last iteration
+    if opt["rank"] == 0 and test_loader is not None:
+        test_results = OrderedDict()
+        test_results["psnr"] = []
+        test_results["ssim"] = []
+        test_results["psnr_y"] = []
+        test_results["ssim_y"] = []
+
+        test_list_dir = opt["datasets"]["test"].get("test_list_dir", None) if opt["datasets"]["test"] else None
+
+        for idx, test_data in enumerate(test_loader):
+            folder = test_data["folder"]
+
+            if test_list_dir is not None:
+                pass
+            elif tsf > 1:
+                test_data["L"] = test_data["L"][:, ::tsf]
+
+            model.feed_data(test_data)
+            model.test()
+
+            visuals = model.current_visuals()
+            output = visuals["E"]
+            gt = visuals["H"] if "H" in visuals else None
+
+            if gt is not None and gt.shape[0] > output.shape[0]:
+                gt = gt[: output.shape[0]]
+
+            test_results_folder = OrderedDict()
+            test_results_folder["psnr"] = []
+            test_results_folder["ssim"] = []
+            test_results_folder["psnr_y"] = []
+            test_results_folder["ssim_y"] = []
+
+            for i in range(output.shape[0]):
+                img = output[i, ...].clamp_(0, 1).numpy()
+                if img.ndim == 3:
+                    img = np.transpose(img[[2, 1, 0], :, :], (1, 2, 0))
+                img = (img * 255.0).round().astype(np.uint8)
+                if opt["val"]["save_img"]:
+                    save_dir = opt["path"]["images"]
+                    util.mkdir(save_dir)
+                    seq_ = os.path.basename(test_data["lq_path"][i][0]).split(".")[0]
+                    os.makedirs(f"{save_dir}/{folder[0]}", exist_ok=True)
+                    cv2.imwrite(f"{save_dir}/{folder[0]}/{seq_}_{current_step:d}.png", img)
+
+                if gt is not None:
+                    img_gt = gt[i, ...].clamp_(0, 1).numpy()
+                    if img_gt.ndim == 3:
+                        img_gt = np.transpose(img_gt[[2, 1, 0], :, :], (1, 2, 0))
+                    img_gt = (img_gt * 255.0).round().astype(np.uint8)
+                    img_gt = np.squeeze(img_gt)
+
+                    test_results_folder["psnr"].append(util.calculate_psnr(img, img_gt, border=0))
+                    test_results_folder["ssim"].append(util.calculate_ssim(img, img_gt, border=0))
+                    if img_gt.ndim == 3:
+                        img = util.bgr2ycbcr(img.astype(np.float32) / 255.0) * 255.0
+                        img_gt = util.bgr2ycbcr(img_gt.astype(np.float32) / 255.0) * 255.0
+                        test_results_folder["psnr_y"].append(util.calculate_psnr(img, img_gt, border=0))
+                        test_results_folder["ssim_y"].append(util.calculate_ssim(img, img_gt, border=0))
+                    else:
+                        test_results_folder["psnr_y"] = test_results_folder["psnr"]
+                        test_results_folder["ssim_y"] = test_results_folder["ssim"]
+
+            if gt is not None and len(test_results_folder["psnr"]) > 0:
+                psnr = sum(test_results_folder["psnr"]) / len(test_results_folder["psnr"])
+                ssim = sum(test_results_folder["ssim"]) / len(test_results_folder["ssim"])
+                psnr_y = sum(test_results_folder["psnr_y"]) / len(test_results_folder["psnr_y"])
+                ssim_y = sum(test_results_folder["ssim_y"]) / len(test_results_folder["ssim_y"])
+                logger.info(
+                    "Testing {:20s} ({:2d}/{}) - PSNR: {:.2f} dB; SSIM: {:.4f}; "
+                    "PSNR_Y: {:.2f} dB; SSIM_Y: {:.4f}".format(
+                        folder[0], idx, len(test_loader), psnr, ssim, psnr_y, ssim_y
+                    )
+                )
+                test_results["psnr"].append(psnr)
+                test_results["ssim"].append(ssim)
+                test_results["psnr_y"].append(psnr_y)
+                test_results["ssim_y"].append(ssim_y)
+            else:
+                logger.info("Testing {:20s}  ({:2d}/{})".format(folder[0], idx, len(test_loader)))
+
+        if len(test_results["psnr"]) > 0:
+            ave_psnr = sum(test_results["psnr"]) / len(test_results["psnr"])
+            ave_ssim = sum(test_results["ssim"]) / len(test_results["ssim"])
+            ave_psnr_y = sum(test_results["psnr_y"]) / len(test_results["psnr_y"])
+            ave_ssim_y = sum(test_results["ssim_y"]) / len(test_results["ssim_y"])
+            logger.info(
+                "<Final, iter:{:8,d} Average PSNR: {:.2f} dB; SSIM: {:.4f}; "
+                "PSNR_Y: {:.2f} dB; SSIM_Y: {:.4f}".format(current_step, ave_psnr, ave_ssim, ave_psnr_y, ave_ssim_y)
+            )
+            wandb.log(
+                {
+                    "val/PSNR": ave_psnr,
+                    "val/SSIM": ave_ssim,
+                    "val/PSNR_Y": ave_psnr_y,
+                    "val/SSIM_Y": ave_ssim_y,
+                },
+                step=current_step,
+            )
+
     if opt["rank"] == 0:
         wandb.finish()
     sys.exit()
