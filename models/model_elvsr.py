@@ -316,7 +316,15 @@ class ModelELVSR(ModelPlain):
         return max(0.0, self.lambda_flow * frac)
 
     def _compute_flow_supervision_loss(self):
-        """L1 loss between predicted corrected flows and RAFT pseudo-GT (v2l, v2r)."""
+        """L1 loss between refined interpolation flows and RAFT pseudo-GT.
+
+        The spatiotemporal model may expose either:
+            - legacy ``v2l`` / ``v2r`` virtual-to-bracket flows, or
+            - refined ``l2v`` / ``r2v`` bracket-to-virtual splatting flows.
+
+        The latter is the current learned target after unifying flow
+        correction into the STVSR flow refiner.
+        """
         lam = self._current_flow_loss_weight
         if self.raft_model is None or lam <= 0:
             return None
@@ -346,9 +354,14 @@ class ModelELVSR(ModelPlain):
                 if k not in per_k:
                     continue
                 gt_flows = per_k[k]
-                total = total + F.l1_loss(flow_dict["v2l"], gt_flows["v2l"])
-                total = total + F.l1_loss(flow_dict["v2r"], gt_flows["v2r"])
-                n_terms += 2
+                if "l2v" in flow_dict and "r2v" in flow_dict:
+                    total = total + F.l1_loss(flow_dict["l2v"], gt_flows["l2v"])
+                    total = total + F.l1_loss(flow_dict["r2v"], gt_flows["r2v"])
+                    n_terms += 2
+                elif "v2l" in flow_dict and "v2r" in flow_dict:
+                    total = total + F.l1_loss(flow_dict["v2l"], gt_flows["v2l"])
+                    total = total + F.l1_loss(flow_dict["v2r"], gt_flows["v2r"])
+                    n_terms += 2
         if n_terms == 0:
             return None
         return lam * total / n_terms
