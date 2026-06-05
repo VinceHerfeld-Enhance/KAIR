@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from contextlib import nullcontext
 import glob
 import os
 import torch
@@ -25,10 +26,46 @@ class ModelPlain(ModelBase):
         # define network
         # ------------------------------------
         self.opt_train = self.opt["train"]  # training option
+        self.use_amp = False
+        self.amp_dtype = torch.float16
         self.netG = define_G(opt)
         self.netG = self.model_to_device(self.netG)
+        self.netG = self.maybe_compile_forward(self.netG, module_name="netG")
         if self.opt_train["E_decay"] > 0:
             self.netE = define_G(opt).to(self.device).eval()
+
+    def _resolve_amp_dtype(self, dtype_name):
+        if dtype_name is None:
+            return torch.float16
+        key = str(dtype_name).strip().lower()
+        if key in ("float16", "fp16", "half"):
+            return torch.float16
+        if key in ("bfloat16", "bf16"):
+            return torch.bfloat16
+        print(f"Unknown amp_dtype={dtype_name}, falling back to float16.")
+        return torch.float16
+
+    def _autocast_context(self):
+        if not self.use_amp:
+            return nullcontext()
+        return autocast(device_type="cuda", dtype=self.amp_dtype, enabled=True)
+
+    def _detach_log_value(self, value):
+        if isinstance(value, torch.Tensor):
+            return value.detach()
+        return value
+
+    def _materialize_log_dict(self):
+        materialized = OrderedDict()
+        for key, value in self.log_dict.items():
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 1:
+                    materialized[key] = value.item()
+                else:
+                    materialized[key] = value.detach().float().mean().item()
+            else:
+                materialized[key] = value
+        return materialized
 
     """
     # ----------------------------------------
@@ -50,11 +87,19 @@ class ModelPlain(ModelBase):
         self.log_dict = OrderedDict()  # log
 
         # mixed precision
-        self.use_amp = self.opt_train.get("use_amp", False)
+        amp_requested = bool(self.opt_train.get("use_amp", False))
+        self.use_amp = bool(amp_requested and self.device.type == "cuda")
+        self.amp_dtype = self._resolve_amp_dtype(self.opt_train.get("amp_dtype", "float16"))
+        if self.use_amp and self.amp_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            print("AMP bf16 requested but unsupported on this GPU. Falling back to float16.")
+            self.amp_dtype = torch.float16
+        if amp_requested and not self.use_amp:
+            print("AMP requested but CUDA is unavailable. Running in full precision.")
+
         if self.use_amp:
-            self.scaler = GradScaler()
+            self.scaler = GradScaler("cuda", enabled=True)
             self.load_scaler()
-            print("Mixed precision (AMP) training enabled.")
+            print(f"Mixed precision (AMP) training enabled (dtype={self.amp_dtype}).")
         else:
             self.scaler = None
 
@@ -175,6 +220,7 @@ class ModelPlain(ModelBase):
             )
         elif self.opt_train["G_scheduler_type"] == "CosineAnnealingRestartLR":
             from basicsr.models.lr_scheduler import CosineAnnealingRestartLR
+
             self.schedulers.append(
                 CosineAnnealingRestartLR(
                     self.G_optimizer,
@@ -197,9 +243,9 @@ class ModelPlain(ModelBase):
     # feed L/H data
     # ----------------------------------------
     def feed_data(self, data, need_H=True):
-        self.L = data["L"].to(self.device)
+        self.L = data["L"].to(self.device, non_blocking=True)
         if need_H:
-            self.H = data["H"].to(self.device)
+            self.H = data["H"].to(self.device, non_blocking=True)
 
     # ----------------------------------------
     # feed L to netG
@@ -219,14 +265,13 @@ class ModelPlain(ModelBase):
     def optimize_parameters(self, current_step):
         self.G_optimizer.zero_grad()
 
-        if self.use_amp:
-            with autocast(device_type="cuda"):
-                self.netG_forward()
-                G_loss = self.compute_G_loss()
-            self.scaler.scale(G_loss).backward()
-        else:
+        with self._autocast_context():
             self.netG_forward()
             G_loss = self.compute_G_loss()
+
+        if self.use_amp:
+            self.scaler.scale(G_loss).backward()
+        else:
             G_loss.backward()
 
         # ------------------------------------
@@ -270,7 +315,7 @@ class ModelPlain(ModelBase):
             self.netG.apply(regularizer_clip)
 
         # self.log_dict['G_loss'] = G_loss.item()/self.E.size()[0]  # if `reduction='sum'`
-        self.log_dict["G_loss"] = G_loss.item()
+        self.log_dict["G_loss"] = self._detach_log_value(G_loss)
 
         if self.opt_train["E_decay"] > 0:
             self.update_E(self.opt_train["E_decay"])
@@ -281,7 +326,8 @@ class ModelPlain(ModelBase):
     def test(self):
         self.netG.eval()
         with torch.no_grad():
-            self.netG_forward()
+            with self._autocast_context():
+                self.netG_forward()
         self.netG.train()
 
     # ----------------------------------------
@@ -290,14 +336,15 @@ class ModelPlain(ModelBase):
     def testx8(self):
         self.netG.eval()
         with torch.no_grad():
-            self.E = test_mode(self.netG, self.L, mode=3, sf=self.opt["scale"], modulo=1)
+            with self._autocast_context():
+                self.E = test_mode(self.netG, self.L, mode=3, sf=self.opt["scale"], modulo=1)
         self.netG.train()
 
     # ----------------------------------------
     # get log_dict
     # ----------------------------------------
     def current_log(self):
-        return self.log_dict
+        return self._materialize_log_dict()
 
     # ----------------------------------------
     # get L, E, H image
@@ -364,4 +411,4 @@ class ModelPlain(ModelBase):
         H_flat = self.H.detach().float().flatten(0, 1)
         mse = nn.MSELoss()(E_flat, H_flat)
         psnr = 10 * torch.log10(1 / mse)
-        self.log_dict["PSNR"] = psnr.item()
+        self.log_dict["PSNR"] = self._detach_log_value(psnr)

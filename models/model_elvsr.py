@@ -50,7 +50,7 @@ class ModelELVSR(ModelPlain):
     def feed_data(self, data, need_H=True):
         super(ModelELVSR, self).feed_data(data, need_H)
         if "gt_indices" in data:
-            self.gt_indices = data["gt_indices"].to(self.device)  # (B, K)
+            self.gt_indices = data["gt_indices"].to(self.device, non_blocking=True)  # (B, K)
         else:
             self.gt_indices = None
         # Store full GT sequence for flow supervision (before any sparse indexing).
@@ -58,7 +58,7 @@ class ModelELVSR(ModelPlain):
         # needed frames and H_full_indices maps positions back to the original
         # full-sequence indexing. H_full == H in that case (same tensor).
         if "H_full" in data:
-            self.H_full = data["H_full"].to(self.device)
+            self.H_full = data["H_full"].to(self.device, non_blocking=True)
         else:
             self.H_full = self.H  # when no sparse GT, H is the full sequence
         # Mapping from H_full positions → original absolute GT frame indices.
@@ -98,13 +98,13 @@ class ModelELVSR(ModelPlain):
         # ---- Auxiliary flow supervision for intermediate flow corrector ----
         flow_loss = self._compute_flow_supervision_loss()
         if flow_loss is not None:
-            self.log_dict["flow_loss"] = flow_loss.item()
+            self.log_dict["flow_loss"] = self._detach_log_value(flow_loss)
             G_loss = G_loss + flow_loss
 
         # ---- V-JEPA video perceptual loss ----
         vjepa_loss = self._compute_vjepa_loss()
         if vjepa_loss is not None:
-            self.log_dict["vjepa_loss"] = vjepa_loss.item()
+            self.log_dict["vjepa_loss"] = self._detach_log_value(vjepa_loss)
             G_loss = G_loss + vjepa_loss
 
         return G_loss
@@ -381,7 +381,7 @@ class ModelELVSR(ModelPlain):
             H_flat = self.H.detach().float().flatten(0, 1)
         mse = nn.MSELoss()(E_flat, H_flat)
         psnr = 10 * torch.log10(1 / mse)
-        self.log_dict["PSNR"] = psnr.item()
+        self.log_dict["PSNR"] = self._detach_log_value(psnr)
 
     # ----------------------------------------
     # define optimizer
@@ -513,7 +513,8 @@ class ModelELVSR(ModelPlain):
             self.L = torch.cat([self.L, self.L.flip(1)], dim=1)
 
         with torch.no_grad():
-            self.E = self._test_video(self.L)
+            with self._autocast_context():
+                self.E = self._test_video(self.L)
 
         if flip_seq:
             n_out = n  # tsf == 1 here
@@ -612,9 +613,11 @@ class ModelELVSR(ModelPlain):
                 for w_idx in w_idx_list:
                     in_patch = lq[..., h_idx : h_idx + size_patch_testing, w_idx : w_idx + size_patch_testing]
                     if hasattr(self, "netE"):
-                        out_patch = self.netE(in_patch).detach().cpu()
+                        with self._autocast_context():
+                            out_patch = self.netE(in_patch).detach().cpu()
                     else:
-                        out_patch = self.netG(in_patch).detach().cpu()
+                        with self._autocast_context():
+                            out_patch = self.netG(in_patch).detach().cpu()
 
                     out_patch_mask = torch.ones_like(out_patch)
 
@@ -653,9 +656,11 @@ class ModelELVSR(ModelPlain):
             lq = torch.cat([lq, torch.flip(lq[:, :, :, :, -w_pad:], [4])], 4)
 
             if hasattr(self, "netE"):
-                output = self.netE(lq).detach().cpu()
+                with self._autocast_context():
+                    output = self.netE(lq).detach().cpu()
             else:
-                output = self.netG(lq).detach().cpu()
+                with self._autocast_context():
+                    output = self.netG(lq).detach().cpu()
 
             output = output[:, :, :, : h_old * sf, : w_old * sf]
 

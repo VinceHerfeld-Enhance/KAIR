@@ -125,6 +125,74 @@ class ModelBase:
 
         return network
 
+    def _torch_compile_cfg(self):
+        """Return normalized torch.compile config dict."""
+        train_opt = self.opt.get("train", {}) if isinstance(self.opt, dict) else {}
+        cfg = train_opt.get("torch_compile", None)
+
+        if isinstance(cfg, bool):
+            cfg = {"enable": cfg}
+        elif cfg is None:
+            cfg = {"enable": bool(train_opt.get("torch_compile_enable", False))}
+        elif not isinstance(cfg, dict):
+            cfg = {"enable": False}
+
+        cfg.setdefault("enable", False)
+        cfg.setdefault("backend", "inductor")
+        cfg.setdefault("mode", "reduce-overhead")
+        cfg.setdefault("dynamic", True)
+        cfg.setdefault("fullgraph", False)
+        cfg.setdefault("disable", False)
+        cfg.setdefault("cuda_only", True)
+        return cfg
+
+    def maybe_compile_forward(self, module, module_name="module", compile_cfg=None):
+        """Compile a module forward path when enabled in options.
+
+        This compiles only ``forward`` instead of wrapping the entire module,
+        which keeps checkpoint keys unchanged.
+        """
+        cfg = self._torch_compile_cfg() if compile_cfg is None else dict(compile_cfg)
+        if not cfg.get("enable", False):
+            return module
+        if cfg.get("disable", False):
+            return module
+        if cfg.get("cuda_only", True) and self.device.type != "cuda":
+            print(f"[torch.compile] Skip {module_name}: CUDA-only requested on device={self.device}.")
+            return module
+        if not hasattr(torch, "compile"):
+            print(f"[torch.compile] Skip {module_name}: torch.compile is unavailable in this PyTorch build.")
+            return module
+
+        bare = self.get_bare_model(module)
+        if getattr(bare, "_forward_is_compiled", False):
+            return module
+
+        try:
+            bare.forward = torch.compile(
+                bare.forward,
+                backend=cfg.get("backend", "inductor"),
+                mode=cfg.get("mode", "reduce-overhead"),
+                dynamic=bool(cfg.get("dynamic", True)),
+                fullgraph=bool(cfg.get("fullgraph", False)),
+                disable=bool(cfg.get("disable", False)),
+            )
+            bare._forward_is_compiled = True
+            print(
+                "[torch.compile] Compiled {}.forward "
+                "(backend={}, mode={}, dynamic={}, fullgraph={})".format(
+                    module_name,
+                    cfg.get("backend", "inductor"),
+                    cfg.get("mode", "reduce-overhead"),
+                    bool(cfg.get("dynamic", True)),
+                    bool(cfg.get("fullgraph", False)),
+                )
+            )
+        except Exception as exc:
+            print(f"[torch.compile] Failed to compile {module_name}.forward: {exc}")
+
+        return module
+
     # ----------------------------------------
     # network name and number of parameters
     # ----------------------------------------

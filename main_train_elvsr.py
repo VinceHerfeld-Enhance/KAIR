@@ -2,6 +2,8 @@ import sys
 import os.path
 import math
 import argparse
+import warnings
+
 import time
 import random
 import cv2
@@ -21,6 +23,81 @@ from data.select_dataset import define_Dataset
 from models.select_model import define_Model
 
 import wandb
+
+
+def _build_dataloader_kwargs(dataset_opt, runtime_opt=None, phase="train", distributed=False, num_gpu=1):
+    runtime_opt = runtime_opt or {}
+    loader_opt = runtime_opt.get("dataloader", {}) if isinstance(runtime_opt.get("dataloader", {}), dict) else {}
+
+    if phase == "train":
+        batch_size = (
+            dataset_opt["dataloader_batch_size"] // num_gpu if distributed else dataset_opt["dataloader_batch_size"]
+        )
+        num_workers = (
+            dataset_opt["dataloader_num_workers"] // num_gpu if distributed else dataset_opt["dataloader_num_workers"]
+        )
+        shuffle = False if distributed else dataset_opt["dataloader_shuffle"]
+        default_prefetch = 4
+    else:
+        batch_size = dataset_opt.get("dataloader_batch_size", 1)
+        num_workers = dataset_opt.get("dataloader_num_workers", loader_opt.get("val_num_workers", 2))
+        shuffle = False
+        default_prefetch = 2
+
+    kwargs = {
+        "batch_size": batch_size,
+        "shuffle": shuffle,
+        "num_workers": num_workers,
+        "drop_last": phase == "train",
+        "pin_memory": bool(loader_opt.get("pin_memory", True)),
+    }
+
+    if num_workers > 0:
+        kwargs["persistent_workers"] = bool(loader_opt.get("persistent_workers", True))
+        kwargs["prefetch_factor"] = int(loader_opt.get("prefetch_factor", default_prefetch))
+
+    return kwargs
+
+
+def _setup_runtime_performance(opt, logger=None):
+    """Enable safe runtime-level speed knobs for CUDA training."""
+    train_opt = opt.get("train", {}) if isinstance(opt, dict) else {}
+    perf_opt = train_opt.get("runtime", {}) if isinstance(train_opt.get("runtime", {}), dict) else {}
+
+    if torch.cuda.is_available():
+        cudnn_benchmark = bool(perf_opt.get("cudnn_benchmark", True))
+        torch.backends.cudnn.benchmark = cudnn_benchmark
+
+        allow_tf32 = bool(perf_opt.get("allow_tf32", True))
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+
+        matmul_precision = perf_opt.get("matmul_precision", "high")
+        if matmul_precision in ("high", "medium", "highest"):
+            torch.set_float32_matmul_precision(matmul_precision)
+
+        msg = (
+            f"Runtime perf: cudnn.benchmark={cudnn_benchmark}, "
+            f"allow_tf32={allow_tf32}, matmul_precision={matmul_precision}"
+        )
+        if logger is not None:
+            logger.info(msg)
+        else:
+            print(msg)
+
+        loader_opt = perf_opt.get("dataloader", {}) if isinstance(perf_opt.get("dataloader", {}), dict) else {}
+        if loader_opt:
+            loader_msg = (
+                "Runtime dataloader: "
+                f"pin_memory={bool(loader_opt.get('pin_memory', True))}, "
+                f"persistent_workers={bool(loader_opt.get('persistent_workers', True))}, "
+                f"prefetch_factor={int(loader_opt.get('prefetch_factor', 4))}, "
+                f"val_num_workers={int(loader_opt.get('val_num_workers', 2))}"
+            )
+            if logger is not None:
+                logger.info(loader_msg)
+            else:
+                print(loader_msg)
 
 
 def _extract_frame_number(filename):
@@ -145,6 +222,9 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
         utils_logger.logger_info(logger_name, os.path.join(opt["path"]["log"], logger_name + ".log"))
         logger = logging.getLogger(logger_name)
         logger.info(option.dict2str(opt))
+        _setup_runtime_performance(opt, logger)
+    else:
+        _setup_runtime_performance(opt, None)
 
     # ----------------------------------------
     # seed
@@ -195,34 +275,33 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
             train_size = int(math.ceil(len(train_set) / dataset_opt["dataloader_batch_size"]))
             if opt["rank"] == 0:
                 logger.info("Number of train images: {:,d}, iters: {:,d}".format(len(train_set), train_size))
+            train_loader_kwargs = _build_dataloader_kwargs(
+                dataset_opt,
+                opt.get("train", {}).get("runtime", {}),
+                phase="train",
+                distributed=opt["dist"],
+                num_gpu=opt["num_gpu"],
+            )
             if opt["dist"]:
                 train_sampler = DistributedSampler(
                     train_set, shuffle=dataset_opt["dataloader_shuffle"], drop_last=True, seed=seed
                 )
                 train_loader = DataLoader(
                     train_set,
-                    batch_size=dataset_opt["dataloader_batch_size"] // opt["num_gpu"],
-                    shuffle=False,
-                    num_workers=dataset_opt["dataloader_num_workers"] // opt["num_gpu"],
-                    drop_last=True,
-                    pin_memory=True,
                     sampler=train_sampler,
+                    **train_loader_kwargs,
                 )
             else:
-                train_loader = DataLoader(
-                    train_set,
-                    batch_size=dataset_opt["dataloader_batch_size"],
-                    shuffle=dataset_opt["dataloader_shuffle"],
-                    num_workers=dataset_opt["dataloader_num_workers"],
-                    drop_last=True,
-                    pin_memory=True,
-                )
+                train_loader = DataLoader(train_set, **train_loader_kwargs)
 
         elif phase == "test":
             test_set = define_Dataset(dataset_opt)
-            test_loader = DataLoader(
-                test_set, batch_size=1, shuffle=False, num_workers=1, drop_last=False, pin_memory=True
+            test_loader_kwargs = _build_dataloader_kwargs(
+                dataset_opt,
+                opt.get("train", {}).get("runtime", {}),
+                phase="test",
             )
+            test_loader = DataLoader(test_set, **test_loader_kwargs)
         else:
             raise NotImplementedError("Phase [%s] is not recognized." % phase)
 
@@ -330,8 +409,9 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                     message += "{:s}: {:.3e} ".format(k, v)
                 logger.info(message)
                 if opt["rank"] == 0:
-                    wandb.log({f"train/{k}": v for k, v in logs.items()}, step=current_step)
-                    wandb.log({"train/lr": model.current_learning_rate()}, step=current_step)
+                    wandb_log = {f"train/{k}": v for k, v in logs.items()}
+                    wandb_log["train/lr"] = model.current_learning_rate()
+                    wandb.log(wandb_log, step=current_step)
 
             # -------------------------------
             # 4b) debug: save train frames
