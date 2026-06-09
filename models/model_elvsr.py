@@ -417,6 +417,13 @@ class ModelELVSR(ModelPlain):
                     betas=self.opt_train["G_optimizer_betas"],
                     weight_decay=self.opt_train["G_optimizer_wd"],
                 )
+            elif self.opt_train["G_optimizer_type"] == "adamw":
+                self.G_optimizer = torch.optim.AdamW(
+                    G_optim_params,
+                    lr=base_lr,
+                    betas=self.opt_train["G_optimizer_betas"],
+                    weight_decay=self.opt_train["G_optimizer_wd"],
+                )
             else:
                 raise NotImplementedError
             return
@@ -442,6 +449,13 @@ class ModelELVSR(ModelPlain):
 
             if self.opt_train["G_optimizer_type"] == "adam":
                 self.G_optimizer = Adam(
+                    G_optim_params,
+                    lr=self.opt_train["G_optimizer_lr"],
+                    betas=self.opt_train["G_optimizer_betas"],
+                    weight_decay=self.opt_train["G_optimizer_wd"],
+                )
+            elif self.opt_train["G_optimizer_type"] == "adamw":
+                self.G_optimizer = torch.optim.AdamW(
                     G_optim_params,
                     lr=self.opt_train["G_optimizer_lr"],
                     betas=self.opt_train["G_optimizer_betas"],
