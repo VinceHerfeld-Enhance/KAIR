@@ -293,184 +293,36 @@ def define_G(opt):
     # ----------------------------------------
     # others
     # ----------------------------------------
-    elif net_type == "elvsr-fgda":
-        from vsr.research_models.elvsr_fgda import VSRNet
+    elif net_type == "stvsr":
+        from vsr.research_models.stvsr_model import STVSRNet
 
-        netG = VSRNet(
-            sf=opt_net.get("sf", 4),
-            prior_mode=opt_net.get("prior_mode", "recurrent"),
-            window_size=opt_net.get("window_size", 3),
-            prior_history_length=opt_net.get("prior_history_length", 1),
-            alignment_mode=opt_net.get("alignment_mode", "spynet"),
-            features=opt_net.get("features", 64),
-            enc_nc=opt_net.get("enc_nc", [32, 48, 64, 96]),
-            spynet_path=opt_net.get("spynet_path", "pretrained/spynet.pth"),
-            dcn_deformable_groups=opt_net.get("dcn_deformable_groups", 8),
-            dcn_max_residue_magnitude=opt_net.get("dcn_max_residue_magnitude", 10.0),
-            fusion_mode=opt_net.get("fusion_mode", "fgda"),
-            residual_prior=opt_net.get("residual_prior", True),
-            state_list=opt_net.get("state_list", None),
-            prior_ssm_type=opt_net.get("prior_ssm_type", None),
-            fusion_ssm_type=opt_net.get("fusion_ssm_type", None),
-        )
-    elif net_type == "elvsr":
-        from vsr.research_models.elvsr import VSRNet
-
-        netG = VSRNet(
-            sf=opt_net.get("sf", 4),
-            prior_mode=opt_net.get("prior_mode", "recurrent"),
-            window_size=opt_net.get("window_size", 3),
-            prior_history_length=opt_net.get("prior_history_length", 1),
-            anti_ghost_mode=opt_net.get("anti_ghost_mode", "sigmoid"),
-            alignment_mode=opt_net.get("alignment_mode", "spynet"),
-            photometric_threshold=opt_net.get("photometric_threshold", 0.5),
-            refine_flows=opt_net.get("refine_flows", False),
-            feature_flow_refine=opt_net.get("feature_flow_refine", True),
-            refine_features=opt_net.get("refine_features", False),
-            n_flows_per_frame=opt_net.get("n_flows_per_frame", 1),
-            flow_refine_mode=opt_net.get("flow_refine_mode", "basic"),
-            fill_holes=opt_net.get("fill_splat_holes", True),
-            residual_prior=opt_net.get("residual_prior", False),
-            focus_fill=opt_net.get("focus_fill", False),
-            filling_prior=opt_net.get("filling_prior", False),
-            features=opt_net.get("features", 3),
-            enc_nc=opt_net.get("enc_nc", [16, 16, 16, 16]),
-            prior_nc=opt_net.get("prior_nc", [64, 128, 256, 512]),
-            feature_anti_ghost=opt_net.get("feature_anti_ghost", False),
-            anti_ghost_groups=opt_net.get("anti_ghost_groups", 1),
-            state_list=opt_net.get("state_list", ["temp", "up3", "up2", "up1"]),
-            feature_refine_ssm_type=opt_net.get("feature_refine_ssm_type", None),
-            spynet_path=opt_net.get("spynet_path", "pretrained/spynet.pth"),
-            interpolation_mode=opt_net.get("interpolation_mode", "bilinear"),
-            compose_flows=opt_net.get("compose_flows", False),
-        )
-    elif net_type == "elvsr-bidir":
-        from vsr.research_models.elvsr_bidir import VSRNet
-
-        netG = VSRNet(
-            mid_channels=opt_net.get("mid_channels", 64),
-            num_blocks=opt_net.get("num_blocks", 7),
-            max_residue_magnitude=opt_net.get("max_residue_magnitude", 10),
+        netG = STVSRNet(
+            mid_channels=opt_net.get("mid_channels", 256),
+            encoder_type=opt_net.get("encoder_type", "rvrt"),
+            encoder_kwargs=opt_net.get("encoder_kwargs", None),
             is_low_res_input=opt_net.get("is_low_res_input", True),
-            spynet_path=opt_net.get("spynet_path", "pretrained/spynet.pth"),
-            cpu_cache_length=opt_net.get("cpu_cache_length", 100),
-            prior_nc=opt_net.get("prior_nc", [64, 128, 256, 512]),
-            refine_flows=opt_net.get("refine_flows", False),
-            refine_features=opt_net.get("refine_features", False),
-            modules=opt_net.get("modules", ["backward_1", "forward_1", "backward_2", "forward_2"]),
-            splat_window_size=opt_net.get("splat_window_size", 1),
-            refine_guidance_mode=opt_net.get("refine_guidance_mode", "occlusion"),
-            flow_refine_feature_source=opt_net.get("flow_refine_feature_source", "reconstruction"),
-            ag_guidance_mode=opt_net.get("ag_guidance_mode", "occlusion"),
-            n_flows_per_frame=opt_net.get("n_flows_per_frame", 1),
-            propagation_mode=opt_net.get("propagation_mode", "sequential"),
-            num_hier_levels=opt_net.get("num_hier_levels", 2),
-        )
-    elif net_type == "elvsr-bidir-latent":
-        from vsr.research_models.elvsr_bidir_latent import VSRNet
-
-        netG = VSRNet(
-            context_size=opt_net.get("context_size", 20),
-            clip_size=opt_net.get("clip_size", 5),
-            mid_channels=opt_net.get("mid_channels", 64),
-            num_blocks=opt_net.get("num_blocks", 7),
-            max_residue_magnitude=opt_net.get("max_residue_magnitude", 10),
-            is_low_res_input=opt_net.get("is_low_res_input", True),
-            spynet_path=opt_net.get("spynet_path", "pretrained/spynet.pth"),
-            cpu_cache_length=opt_net.get("cpu_cache_length", 100),
-            prior_nc=opt_net.get("prior_nc", [64, 128, 256, 512]),
-            refine_flows=opt_net.get("refine_flows", False),
-        )
-    elif net_type == "basicvsrpp":
-        from basicsr.archs.basicvsr_arch import BasicVSRPlusPlus as net
-
-        netG = net(
-            mid_channels=opt_net.get("mid_channels", 64),
-            num_blocks=opt_net.get("num_blocks", 7),
-            max_residue_magnitude=opt_net.get("max_residue_magnitude", 10),
-            is_low_res_input=opt_net.get("is_low_res_input", True),
-            spynet_path=opt_net.get("spynet_path", "pretrained/spynet.pth"),
-            cpu_cache_length=opt_net.get("cpu_cache_length", 100),
-        )
-    elif net_type == "iart_splat":
-        from vsr.research_models.IART_splat import VSRNet as net
-
-        netG = net(
-            in_channels=opt_net.get("in_channels", 3),
-            mid_channels=opt_net.get("mid_channels", 64),
-            embed_dim=opt_net.get("embed_dim", 120),
-            depths=opt_net.get("depths", [6, 6, 6, 6, 6, 6]),
-            num_heads=opt_net.get("num_heads", [6, 6, 6, 6, 6, 6]),
-            window_size=opt_net.get("window_size", [3, 8, 8]),
-            num_frames=opt_net.get("num_frames", 3),
-            img_size=opt_net.get("img_size", 64),
-            patch_size=opt_net.get("patch_size", 1),
-            cpu_cache_length=opt_net.get("cpu_cache_length", 100),
-            is_low_res_input=opt_net.get("is_low_res_input", True),
-            use_checkpoint=opt_net.get("use_checkpoint", [True, True, True, True]),
-            refine_flows=opt_net.get("refine_flows", True),
-            n_flows_per_frame=opt_net.get("n_flows_per_frame", 1),
-            prior_nc=opt_net.get("prior_nc", [64, 128, 256, 512]),
-            spynet_path=opt_net.get(
-                "spynet_path", "/home/vherfeld/storage/vherfeld/other_checkpoints/SpyNet/spynet.pth"
-            ),
-            splat_window_size=opt_net.get("splat_window_size", 1),
-        )
-    elif net_type == "elvsr-online":
-        from vsr.research_models.elvsr_online import OnlineVSRNet
-
-        netG = OnlineVSRNet(
-            sf=opt_net.get("sf", 4),
-            prior_nc=opt_net.get("prior_nc", [64, 128, 256, 512]),
-            anti_ghost_nc=opt_net.get("anti_ghost_nc", [16, 16, 16, 16]),
-            enc_nc=opt_net.get("enc_nc", [16, 16, 16, 16]),
-            flow_refine_nc=opt_net.get("flow_refine_nc", [32, 64, 128, 128]),
-            features=opt_net.get("features", 64),
-        )
-    elif net_type == "elvsr-stvsr":
-        from vsr.research_models.elvsr_spatiotemporal import VSRTemporalNet
-
-        netG = VSRTemporalNet(
-            mid_channels=opt_net.get("mid_channels", 64),
-            embed_dim=opt_net.get("embed_dim", 120),
-            num_blocks=opt_net.get("num_blocks", 7),
-            max_residue_magnitude=opt_net.get("max_residue_magnitude", 10),
-            alignment_mode=opt_net.get("alignment_mode", "implicit"),
-            deformable_groups=opt_net.get("deformable_groups", 16),
-            is_low_res_input=opt_net.get("is_low_res_input", True),
-            spynet_path=opt_net.get("spynet_path", None),
-            cpu_cache_length=opt_net.get("cpu_cache_length", 100),
             prior_nc=opt_net.get("prior_nc", None),
             prior_type=opt_net.get("prior_type", "resunet"),
-            modules=opt_net.get("modules", None),
-            splat_window_size=opt_net.get("splat_window_size", 1),
-            sf=opt_net.get("sf", 4),
-            tsf=opt_net.get("tsf", 2),
-            support_radius=opt_net.get("support_radius", None),
-            ag_guidance_mode=opt_net.get("ag_guidance_mode", "occlusion"),
-            refine_flows=opt_net.get("refine_flows", False),
-            n_flows_per_frame=opt_net.get("n_flows_per_frame", 1),
-            refine_features=opt_net.get("refine_features", False),
-            refine_guidance_mode=opt_net.get("refine_guidance_mode", "occlusion"),
-            flow_refine_feature_source=opt_net.get("flow_refine_feature_source", "reconstruction"),
-            flow_refiner_arch=opt_net.get("flow_refiner_arch", "basic"),
-            splatting_mode=opt_net.get("splatting_mode", "simple"),
-            learned_surrogate_blend=opt_net.get("learned_surrogate_blend", False),
-            interp_flow_mode=opt_net.get("interp_flow_mode", "quadratic"),
-            backbone_block_type=opt_net.get("backbone_block_type", "conv"),
             prior_mamba_depth=opt_net.get("prior_mamba_depth", 6),
             prior_mamba_expansion=opt_net.get("prior_mamba_expansion", 2),
             prior_mamba_groups=opt_net.get("prior_mamba_groups", 4),
             prior_mamba_stat_channels=opt_net.get("prior_mamba_stat_channels", 16),
             prior_mamba_width=opt_net.get("prior_mamba_width", None),
             prior_mamba_use_checkpoint=opt_net.get("prior_mamba_use_checkpoint", False),
-            swin_prop_img_size=opt_net.get("swin_prop_img_size", 64),
-            swin_prop_depths=opt_net.get("swin_prop_depths", (2, 2, 2)),
-            swin_prop_num_heads=opt_net.get("swin_prop_num_heads", (4, 4, 4)),
-            swin_prop_window_size=opt_net.get("swin_prop_window_size", (3, 8, 8)),
-            swin_prop_use_checkpoint=opt_net.get("swin_prop_use_checkpoint", False),
+            splat_window_size=opt_net.get("splat_window_size", 1),
+            sf=opt_net.get("sf", 4),
+            tsf=opt_net.get("tsf", 2),
+            ag_guidance_mode=opt_net.get("ag_guidance_mode", "occlusion"),
+            refine_flows=opt_net.get("refine_flows", True),
+            n_flows_per_frame=opt_net.get("n_flows_per_frame", 1),
+            refine_features=opt_net.get("refine_features", False),
+            refine_guidance_mode=opt_net.get("refine_guidance_mode", "occlusion"),
+            flow_refiner_arch=opt_net.get("flow_refiner_arch", "basic"),
+            learned_surrogate_blend=opt_net.get("learned_surrogate_blend", True),
+            interp_flow_mode=opt_net.get("interp_flow_mode", "quadratic"),
             unified_prior_adapter=opt_net.get("unified_prior_adapter", True),
         )
+
     else:
         raise NotImplementedError("netG [{:s}] is not found.".format(net_type))
 
