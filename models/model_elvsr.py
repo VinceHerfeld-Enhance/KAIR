@@ -610,11 +610,11 @@ class ModelELVSR(ModelPlain):
 
         sf = self.opt["scale"]
         window_size = self.opt["val"].get("test_window_size", [6, 8, 8])
-        size_patch_testing = self.opt["val"].get("size_patch_testing", 0)
-        assert size_patch_testing % window_size[-1] == 0, "testing patch size should be a multiple of window_size."
+        size_patch_testing = self.opt["val"].get("size_patch_testing", None)
 
         if size_patch_testing:
-            # divide the clip to patches (spatially only, tested patch by patch)
+            assert size_patch_testing % window_size[-1] == 0, "testing patch size should be a multiple of window_size."
+
             overlap_size = 20
             not_overlap_border = True
 
