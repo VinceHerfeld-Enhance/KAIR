@@ -20,11 +20,15 @@ class ModelELVSR(ModelPlain):
 
         # ---- Frozen RAFT for intermediate flow supervision ----
         self.lambda_flow = float(self.opt_train.get("lambda_flow_supervision", 0.0))
-        # Linear decay: lambda_flow decays from its initial value to 0 over
-        # ``flow_loss_decay_steps`` training steps.  Set to 0 (default) to
-        # keep the weight constant.  This lets the corrector bootstrap from
-        # RAFT early on but specialise for VSR later.
+        # Linear decay: lambda_flow decays from its initial value toward
+        # ``flow_loss_min_weight`` over ``flow_loss_decay_steps`` training
+        # steps.  Set ``flow_loss_decay_steps`` to 0 (default) to keep the
+        # weight constant.  This lets the corrector bootstrap from RAFT early
+        # on but specialise for VSR later, while ``flow_loss_min_weight`` keeps
+        # a residual anchor so flows stay sane in ill-posed (textureless /
+        # occluded) regions instead of drifting once the anchor decays.
         self.flow_loss_decay_steps = int(self.opt_train.get("flow_loss_decay_steps", 0))
+        self.flow_loss_min_weight = float(self.opt_train.get("flow_loss_min_weight", 0.0))
         # Teacher-forcing of the interp_flow_net with RAFT pseudo-GT during
         # early training. ``teacher_flow_p0`` is the per-step probability of
         # replacing the corrector output with the RAFT flow at step 0; the
@@ -313,7 +317,8 @@ class ModelELVSR(ModelPlain):
         if self.flow_loss_decay_steps <= 0:
             return self.lambda_flow  # constant
         frac = 1.0 - current_step / float(self.flow_loss_decay_steps)
-        return max(0.0, self.lambda_flow * frac)
+        # Decay toward the floor, not to 0, so a residual RAFT anchor remains.
+        return max(self.flow_loss_min_weight, self.lambda_flow * frac)
 
     def _compute_flow_supervision_loss(self):
         """L1 loss between refined interpolation flows and RAFT pseudo-GT.
