@@ -225,22 +225,30 @@ class ModelELVSR(ModelPlain):
     def _raft_bracket_flows(self, gt_mid_hr, gt_left_hr, gt_right_hr, h_lr, w_lr):
         """RAFT pseudo-GT flows between a mid frame and its L/R bracket.
 
-        RAFT is run directly on LR-downsampled frames (``h_lr``, ``w_lr``) rather
-        than on HR GT followed by flow downsampling. This cuts RAFT compute by
-        ~sf^2 and yields a teacher at the resolution the student's flows actually
-        operate on — a more reachable distillation target. The four directional
+        RAFT is run on the HR GT frames, then the resulting flows are
+        downsampled to the LR grid and rescaled to LR-pixel units — the
+        resolution the student's flows operate on. RAFT is run at HR (not on
+        LR-downsampled frames) because torchvision's RAFT requires inputs of at
+        least 128px (it downsamples by 8 and needs >=16px feature maps); typical
+        LR patches (e.g. gt_size/sf = 64px) are too small. The four directional
         flows (mid->L, mid->R, L->mid, R->mid) are batched into one forward pass.
         ``gt_mid_hr`` may carry per-sample content (a different frame per batch
         row); the bracket frames are shared. Returns ``{'v2l','v2r','l2v','r2v'}``
-        as [B, h_lr, w_lr, 2] flows in LR-pixel units (no rescaling needed).
+        as [B, h_lr, w_lr, 2] flows in LR-pixel units.
         """
-        def _to_lr(x):
-            return F.interpolate(x, size=(h_lr, w_lr), mode="bicubic", align_corners=False).clamp_(0, 1)
-
-        mid, left, right = _to_lr(gt_mid_hr), _to_lr(gt_left_hr), _to_lr(gt_right_hr)
+        mid, left, right = gt_mid_hr, gt_left_hr, gt_right_hr
         src = torch.cat([mid, mid, left, right], dim=0)
         dst = torch.cat([left, right, mid, mid], dim=0)
-        flow_lr_4 = self._raft_flow(src, dst)  # [4B, h_lr, w_lr, 2] at LR res + LR units
+        flow_hr_4 = self._raft_flow(src, dst)  # [4B, H_hr, W_hr, 2] at HR res + HR units
+
+        # Downsample HR flows to the LR grid and rescale magnitudes to LR units.
+        h_hr, w_hr = flow_hr_4.shape[1], flow_hr_4.shape[2]
+        flow_lr_4 = F.interpolate(
+            flow_hr_4.permute(0, 3, 1, 2), size=(h_lr, w_lr), mode="bilinear", align_corners=False
+        ).permute(0, 2, 3, 1)
+        flow_lr_4[..., 0] *= w_lr / w_hr
+        flow_lr_4[..., 1] *= h_lr / h_hr
+
         B = mid.shape[0]
         v2l, v2r, l2v, r2v = flow_lr_4.split(B, dim=0)
         return {"v2l": v2l, "v2r": v2r, "l2v": l2v, "r2v": r2v}
@@ -357,15 +365,38 @@ class ModelELVSR(ModelPlain):
         # Decay toward the floor, not to 0, so a residual RAFT anchor remains.
         return max(self.flow_loss_min_weight, self.lambda_flow * frac)
 
+    @staticmethod
+    def _min_k_flow_loss(pred, gt):
+        """Hindsight (multiple-choice) L1 between predicted flow(s) and the teacher.
+
+        Args:
+            pred: ``[B, K, H, W, 2]`` multi-flow hypotheses, or ``[B, H, W, 2]``
+                  single flow.
+            gt:   ``[B, H, W, 2]`` RAFT pseudo-GT flow.
+
+        Takes a per-pixel ``min`` over the K hypotheses so only the
+        best-matching one is pulled toward the teacher (Guzman-Rivera et al.,
+        MCL), leaving the others free to specialise. Reduces *exactly* to plain
+        L1 when ``K == 1`` (or a single flow is passed), so single-flow configs
+        are unaffected.
+        """
+        if pred.dim() == 4:
+            return F.l1_loss(pred, gt)
+        # pred [B, K, H, W, 2], gt [B, H, W, 2]; mean over the 2 flow components
+        # keeps the scale identical to F.l1_loss in the K == 1 case.
+        d = (pred - gt.unsqueeze(1)).abs().mean(dim=-1)  # [B, K, H, W]
+        return d.min(dim=1).values.mean()
+
     def _compute_flow_supervision_loss(self):
-        """L1 loss between refined interpolation flows and RAFT pseudo-GT.
+        """min-over-K flow loss between refined interpolation flows and RAFT pseudo-GT.
 
         The spatiotemporal model may expose either:
             - legacy ``v2l`` / ``v2r`` virtual-to-bracket flows, or
             - refined ``l2v`` / ``r2v`` bracket-to-virtual splatting flows.
 
         The latter is the current learned target after unifying flow
-        correction into the STVSR flow refiner.
+        correction into the STVSR flow refiner. Each may carry an extra
+        ``n_flows_per_frame`` hypothesis axis, reduced by :meth:`_min_k_flow_loss`.
         """
         lam = self._current_flow_loss_weight
         if self.raft_model is None or lam <= 0:
@@ -405,12 +436,12 @@ class ModelELVSR(ModelPlain):
                         continue
                     gt_flows = gap_pseudo[k]
                 if "l2v" in flow_dict and "r2v" in flow_dict:
-                    total = total + F.l1_loss(flow_dict["l2v"], gt_flows["l2v"])
-                    total = total + F.l1_loss(flow_dict["r2v"], gt_flows["r2v"])
+                    total = total + self._min_k_flow_loss(flow_dict["l2v"], gt_flows["l2v"])
+                    total = total + self._min_k_flow_loss(flow_dict["r2v"], gt_flows["r2v"])
                     n_terms += 2
                 elif "v2l" in flow_dict and "v2r" in flow_dict:
-                    total = total + F.l1_loss(flow_dict["v2l"], gt_flows["v2l"])
-                    total = total + F.l1_loss(flow_dict["v2r"], gt_flows["v2r"])
+                    total = total + self._min_k_flow_loss(flow_dict["v2l"], gt_flows["v2l"])
+                    total = total + self._min_k_flow_loss(flow_dict["v2r"], gt_flows["v2r"])
                     n_terms += 2
         if n_terms == 0:
             return None
