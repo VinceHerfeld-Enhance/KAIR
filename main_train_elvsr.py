@@ -499,7 +499,7 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                     # -------------------------------
                     # debug: save L / E / H frames for first test video
                     # -------------------------------
-                    if idx == 1 and opt["train"]["checkpoint_debug_frames"] and opt["rank"] == 0:
+                    if idx == torch.randint(0, len(test_loader) - 1, (1,)).item() and opt["train"]["checkpoint_debug_frames"] and opt["rank"] == 0:
                         debug_val_dir = os.path.join(
                             opt["path"]["images"], "debug_val", f"iter_{current_step:08d}", folder[0]
                         )
