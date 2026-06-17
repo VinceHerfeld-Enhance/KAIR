@@ -1,11 +1,21 @@
 import numpy as np
 import random
+import cv2
 import torch
 from pathlib import Path
 import torch.utils.data as data
 from torchvision import transforms
 
 import utils.utils_video as utils_video
+
+# OpenCV spawns its own thread pool inside cv2.imdecode (used by imfrombytes).
+# With multiple dataloader workers this oversubscribes the CPU: every worker
+# fights for the same cores, decode latency becomes erratic, the prefetch queue
+# drains unevenly and GPU utilisation sawtooths. Force single-threaded OpenCV so
+# parallelism comes only from the dataloader workers. Set at import so that
+# fork-started workers inherit it; worker_init_fn re-applies it for spawn.
+cv2.setNumThreads(0)
+cv2.ocl.setUseOpenCL(False)
 
 
 class VideoRecurrentTrainDataset(data.Dataset):
@@ -64,6 +74,22 @@ class VideoRecurrentTrainDataset(data.Dataset):
         self.crop_max_retries = opt.get("crop_max_retries", 5)
         self.num_frame = opt["num_frame"]
         self.tsf = int(opt.get("tsf", 1))  # temporal scale factor: only load every tsf-th LQ frame
+        # Per-sample temporal-interpolation supervision: each sample independently
+        # samples n_interp_samples intermediate sub-steps per gap, and ONLY the
+        # input-aligned + sampled intermediate GT frames are decoded (the rest are
+        # never read from disk). Active only when tsf>1 and n_interp_samples is set.
+        self.n_interp_samples = opt.get("n_interp_samples", None)
+        self.per_sample_interp = self.tsf > 1 and self.n_interp_samples is not None
+        if self.per_sample_interp:
+            self.n_interp_samples = int(self.n_interp_samples)
+            assert 1 <= self.n_interp_samples <= self.tsf - 1, (
+                f"n_interp_samples ({self.n_interp_samples}) must be in [1, tsf-1] "
+                f"(tsf={self.tsf})"
+            )
+            assert (self.num_frame - 1) % self.tsf == 0, (
+                f"num_frame ({self.num_frame}) must satisfy (num_frame-1) % tsf == 0 "
+                f"for per-sample temporal interpolation (tsf={self.tsf})"
+            )
 
         keys = []
         total_num_frames = []  # some clips may not have 100 frames
@@ -154,25 +180,46 @@ class VideoRecurrentTrainDataset(data.Dataset):
             neighbor_list.reverse()
 
         # Determine which GT frame positions to load.
-        # sparse_gt_frames: total number of GT frames to supervise on per sample.
-        # When set, always load the first and last GT frames plus random middle ones.
-        # This avoids loading all (num_frame) HR frames when tsf is large.
-        sparse_gt_frames = self.opt.get("sparse_gt_frames", None)
-        if sparse_gt_frames is not None and sparse_gt_frames > 0 and len(neighbor_list) > sparse_gt_frames:
+        interp_k = None
+        if self.per_sample_interp:
+            # Per-sample temporal interpolation: decode only the input-aligned GT
+            # frames plus this sample's randomly sampled intermediate frames. Each
+            # gap independently samples n_interp_samples sub-steps in [1, tsf-1].
+            # GT layout is structural: per gap g we emit the input frame at g*tsf
+            # followed by its sorted mids, so output frame positions are
+            # deterministic given (gap, slot) and align 1:1 with the network output.
             n = len(neighbor_list)
-            fixed_indices = [0, n - 1]
-            n_random = max(0, sparse_gt_frames - 2)
-            middle = [i for i in range(1, n - 1)]
-            rand_middle = sorted(random.sample(middle, min(n_random, len(middle))))
-            gt_indices = sorted(set(fixed_indices + rand_middle))
+            T_in = (n - 1) // self.tsf + 1
+            n_gaps = T_in - 1
+            interp_k = [
+                sorted(random.sample(range(1, self.tsf), self.n_interp_samples)) for _ in range(n_gaps)
+            ]
+            gt_pos = [g * self.tsf for g in range(T_in)]  # input-aligned
+            for g in range(n_gaps):
+                for k in interp_k[g]:
+                    gt_pos.append(g * self.tsf + k)  # sampled intermediate
+            gt_indices = sorted(gt_pos)
+            lq_indices = set(range(0, n, self.tsf))
         else:
-            gt_indices = list(range(len(neighbor_list)))
+            # sparse_gt_frames: total number of GT frames to supervise on per sample.
+            # When set, always load the first and last GT frames plus random middle ones.
+            # This avoids loading all (num_frame) HR frames when tsf is large.
+            sparse_gt_frames = self.opt.get("sparse_gt_frames", None)
+            if sparse_gt_frames is not None and sparse_gt_frames > 0 and len(neighbor_list) > sparse_gt_frames:
+                n = len(neighbor_list)
+                fixed_indices = [0, n - 1]
+                n_random = max(0, sparse_gt_frames - 2)
+                middle = [i for i in range(1, n - 1)]
+                rand_middle = sorted(random.sample(middle, min(n_random, len(middle))))
+                gt_indices = sorted(set(fixed_indices + rand_middle))
+            else:
+                gt_indices = list(range(len(neighbor_list)))
 
-        # Determine which LQ frames to load (subsample by tsf for temporal SR)
-        if self.tsf > 1:
-            lq_indices = set(range(0, len(neighbor_list), self.tsf))
-        else:
-            lq_indices = set(range(len(neighbor_list)))
+            # Determine which LQ frames to load (subsample by tsf for temporal SR)
+            if self.tsf > 1:
+                lq_indices = set(range(0, len(neighbor_list), self.tsf))
+            else:
+                lq_indices = set(range(len(neighbor_list)))
 
         # get the neighboring LQ and GT frames
         img_lqs = []
@@ -227,10 +274,16 @@ class VideoRecurrentTrainDataset(data.Dataset):
         # img_lqs: (t_lq, c, h, w)  — temporally subsampled if tsf > 1
         # img_gts: (k, c, h, w)  where k <= num_frame (sparse) or k == num_frame (full)
         # key: str
-        n_out = (n_lq - 1) * self.tsf + 1 if self.tsf > 1 else n_lq
         result = {"L": img_lqs, "H": img_gts, "key": key}
-        if n_gt < n_out:
-            result["gt_indices"] = torch.tensor(gt_indices, dtype=torch.long)
+        if self.per_sample_interp:
+            # Per-sample sub-step indices, shape [n_gaps, n_interp_samples].
+            # The model turns these into per-sample tau; H is already 1:1 with the
+            # network output (structural order) so no gt_indices mapping is needed.
+            result["interp_k"] = torch.tensor(interp_k, dtype=torch.long)
+        else:
+            n_out = (n_lq - 1) * self.tsf + 1 if self.tsf > 1 else n_lq
+            if n_gt < n_out:
+                result["gt_indices"] = torch.tensor(gt_indices, dtype=torch.long)
         return result
 
     def __len__(self):

@@ -25,6 +25,18 @@ from models.select_model import define_Model
 import wandb
 
 
+def _dataloader_worker_init(worker_id):
+    """Disable OpenCV's internal thread pool inside each dataloader worker.
+
+    Without this, every worker lets cv2.imdecode spawn its own threads, so 16
+    workers oversubscribe the CPU and decode latency becomes erratic -> the
+    prefetch queue drains unevenly and GPU utilisation oscillates. Re-applied
+    here (not only at module import) so it holds under the 'spawn' start method.
+    """
+    cv2.setNumThreads(0)
+    cv2.ocl.setUseOpenCL(False)
+
+
 def _build_dataloader_kwargs(dataset_opt, runtime_opt=None, phase="train", distributed=False, num_gpu=1):
     runtime_opt = runtime_opt or {}
     loader_opt = runtime_opt.get("dataloader", {}) if isinstance(runtime_opt.get("dataloader", {}), dict) else {}
@@ -55,6 +67,7 @@ def _build_dataloader_kwargs(dataset_opt, runtime_opt=None, phase="train", distr
     if num_workers > 0:
         kwargs["persistent_workers"] = bool(loader_opt.get("persistent_workers", True))
         kwargs["prefetch_factor"] = int(loader_opt.get("prefetch_factor", default_prefetch))
+        kwargs["worker_init_fn"] = _dataloader_worker_init
 
     return kwargs
 
@@ -350,22 +363,25 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                 train_data["L"] = train_data["L"][:, ::tsf]
 
             # -------------------------------
-            # 2b) random temporal step sampling — BEFORE feed_data to avoid
-            #     loading unused GT frames onto GPU.
+            # 2b) temporal interpolation sub-step selection
             # -------------------------------
-            if tsf > 1 and n_interp_samples is not None:
-                # Sample a DIFFERENT k per gap for tau diversity within each
-                # iteration. This gives T_in-1 different tau values instead of
-                # repeating the same one across all gaps.
+            # Preferred path: the dataset performs PER-SAMPLE sub-step sampling and
+            # has already decoded only the needed GT frames (input-aligned + each
+            # sample's sampled mids), returning the per-sample sub-steps as
+            # "interp_k" [n_gaps, n_interp_samples]. H is already 1:1 with the
+            # network output (structural order), so nothing is subset here.
+            per_sample_interp = "interp_k" in train_data
+            interp_steps_per_gap = None
+            if not per_sample_interp and tsf > 1 and n_interp_samples is not None:
+                # Legacy batch-shared path (configs that set n_interp_samples on the
+                # train block but NOT on the dataset): one shared k per gap, with GT
+                # subset here after the dataset decoded the full sequence.
                 T_in = train_data["L"].size(1)
                 n_gaps = T_in - 1
                 interp_steps_per_gap = {}
                 for gap_idx in range(n_gaps):
                     interp_steps_per_gap[gap_idx] = sorted(random.sample(range(1, tsf), n_interp_samples))
 
-                # Determine which GT frame indices are needed:
-                #   - input-aligned positions (every tsf-th)
-                #   - sampled intermediate positions for pixel loss (per-gap)
                 gt_indices_set = set()
                 for fi in range(T_in):
                     gt_indices_set.add(fi * tsf)  # input frame
@@ -378,13 +394,16 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                 train_data["H"] = train_data["H"][:, gt_select]
                 # Store index mapping so RAFT can find the right frames in H_full
                 train_data["H_full_indices"] = gt_select
-            else:
-                interp_steps_per_gap = None
 
             model.feed_data(train_data)
 
             # Set interp_steps and gt_indices AFTER feed_data (which resets them)
-            if tsf > 1 and n_interp_samples is not None:
+            if per_sample_interp:
+                # [B, n_gaps, n_interp_samples] long tensor: per-sample sub-steps.
+                # Output is 1:1 with H (structural order) — no gt_indices needed.
+                model.interp_steps = train_data["interp_k"].to(model.device, non_blocking=True)
+                model.gt_indices = None
+            elif interp_steps_per_gap is not None:
                 model.interp_steps = interp_steps_per_gap
                 # With interp_steps active, model output is already 1:1 with gt_select — no gt_indices needed
                 model.gt_indices = None

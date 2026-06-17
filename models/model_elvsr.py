@@ -222,13 +222,45 @@ class ModelELVSR(ModelPlain):
         return flow_lr
 
     @torch.no_grad()
+    def _raft_bracket_flows(self, gt_mid_hr, gt_left_hr, gt_right_hr, h_lr, w_lr):
+        """RAFT pseudo-GT flows between a mid frame and its L/R bracket.
+
+        RAFT is run directly on LR-downsampled frames (``h_lr``, ``w_lr``) rather
+        than on HR GT followed by flow downsampling. This cuts RAFT compute by
+        ~sf^2 and yields a teacher at the resolution the student's flows actually
+        operate on — a more reachable distillation target. The four directional
+        flows (mid->L, mid->R, L->mid, R->mid) are batched into one forward pass.
+        ``gt_mid_hr`` may carry per-sample content (a different frame per batch
+        row); the bracket frames are shared. Returns ``{'v2l','v2r','l2v','r2v'}``
+        as [B, h_lr, w_lr, 2] flows in LR-pixel units (no rescaling needed).
+        """
+        def _to_lr(x):
+            return F.interpolate(x, size=(h_lr, w_lr), mode="bicubic", align_corners=False).clamp_(0, 1)
+
+        mid, left, right = _to_lr(gt_mid_hr), _to_lr(gt_left_hr), _to_lr(gt_right_hr)
+        src = torch.cat([mid, mid, left, right], dim=0)
+        dst = torch.cat([left, right, mid, mid], dim=0)
+        flow_lr_4 = self._raft_flow(src, dst)  # [4B, h_lr, w_lr, 2] at LR res + LR units
+        B = mid.shape[0]
+        v2l, v2r, l2v, r2v = flow_lr_4.split(B, dim=0)
+        return {"v2l": v2l, "v2r": v2r, "l2v": l2v, "r2v": r2v}
+
+    @torch.no_grad()
     def _compute_pseudo_gt_flows(self):
         """Pre-compute RAFT pseudo-GT flows for all (gap, sub-step) pairs.
 
-        Returns a nested dict ``{gap_idx: {k: {'v2l','v2r','l2v','r2v'}}}`` at
-        LR resolution, ready to be fed to ``netG(..., teacher_flows=...)`` and
-        reused by the flow-supervision loss to avoid duplicate RAFT calls.
-        Returns ``None`` if RAFT is not available.
+        Per-sample regime (``self.interp_steps`` is a ``[B, n_gaps, S]`` tensor):
+        returns ``{gap_idx: [slot0, slot1, ...]}`` where each slot is a flow dict
+        and entry ``b`` uses sample ``b``'s own intermediate frame. GT is laid out
+        structurally — input frame ``g`` at position ``g*(S+1)`` and gap ``g`` slot
+        ``s`` at ``g*(S+1)+1+s`` — so per-sample mid frames are read directly with
+        no index map.
+
+        Legacy regime (dict/list/None ``interp_steps``): returns a nested dict
+        ``{gap_idx: {k: {'v2l','v2r','l2v','r2v'}}}``.
+
+        Both are at LR resolution, ready for ``netG(..., teacher_flows=...)`` and
+        reused by the flow-supervision loss. Returns ``None`` if RAFT is absent.
 
         The four directional RAFT calls per ``(gap, k)`` are batched into a
         single forward pass (B*4) and the result is split + downsampled in
@@ -242,8 +274,28 @@ class ModelELVSR(ModelPlain):
             return None
         gt = self.H_full
         h_lr, w_lr = self.L.shape[-2:]
+
+        # ---- Per-sample regime: interp_steps is a [B, n_gaps, S] tensor ----
+        # GT is in structural order (input frame g at g*(S+1); gap g slot s at
+        # g*(S+1)+1+s), so each sample's own mid frame is read directly by
+        # position — no absolute-index map needed.
+        if torch.is_tensor(self.interp_steps):
+            S = self.interp_steps.size(2)
+            n_gaps = self.interp_steps.size(1)
+            stride = S + 1  # one input-aligned frame + S mids per gap
+            out = {}
+            for gap_idx in range(n_gaps):
+                gt_left_hr = gt[:, gap_idx * stride]
+                gt_right_hr = gt[:, (gap_idx + 1) * stride]
+                slots = [
+                    self._raft_bracket_flows(gt[:, gap_idx * stride + 1 + s], gt_left_hr, gt_right_hr, h_lr, w_lr)
+                    for s in range(S)
+                ]
+                out[gap_idx] = slots  # per-slot list (aligned by index, not keyed by k)
+            return out
+
+        # ---- Legacy regime: shared scalar sub-steps (dict / list / None) ----
         T_in = self.L.shape[1]
-        # interp_steps may be a per-gap dict or a flat list
         default_sub_steps = list(range(1, self.tsf))
 
         # Build absolute-index → H_full-position lookup.
@@ -280,25 +332,10 @@ class ModelELVSR(ModelPlain):
                 continue
             per_k = {}
             for k in sub_steps:
-                gt_mid_idx = gt_left_idx + k
-                gt_mid_hr = _get_frame(gt_mid_idx)
+                gt_mid_hr = _get_frame(gt_left_idx + k)
                 if gt_mid_hr is None:
                     continue
-                # Batch all 4 directional RAFT calls into a single forward pass
-                # to reduce kernel launch overhead (4×B at LR-GT resolution is fine).
-                src = torch.cat([gt_mid_hr, gt_mid_hr, gt_left_hr, gt_right_hr], dim=0)
-                dst = torch.cat([gt_left_hr, gt_right_hr, gt_mid_hr, gt_mid_hr], dim=0)
-                flow_hr_4 = self._raft_flow(src, dst)  # [4B, H, W, 2]
-                scale_h = h_lr / flow_hr_4.shape[1]
-                scale_w = w_lr / flow_hr_4.shape[2]
-                flow_lr_4 = F.interpolate(
-                    flow_hr_4.permute(0, 3, 1, 2), size=(h_lr, w_lr), mode="bilinear", align_corners=False
-                ).permute(0, 2, 3, 1)
-                flow_lr_4[..., 0] *= scale_w
-                flow_lr_4[..., 1] *= scale_h
-                B = gt_mid_hr.shape[0]
-                v2l, v2r, l2v, r2v = flow_lr_4.split(B, dim=0)
-                per_k[k] = {"v2l": v2l, "v2r": v2r, "l2v": l2v, "r2v": r2v}
+                per_k[k] = self._raft_bracket_flows(gt_mid_hr, gt_left_hr, gt_right_hr, h_lr, w_lr)
             if per_k:
                 out[gap_idx] = per_k
         return out
@@ -341,24 +378,32 @@ class ModelELVSR(ModelPlain):
             return None
 
         aux_flows = net._aux_interp_flows  # list of per-gap lists of dicts
+        per_sample = torch.is_tensor(self.interp_steps)
         total = self.L.new_tensor(0.0)
         n_terms = 0
         for gap_idx, gap_flows in enumerate(aux_flows):
             if gap_idx not in pseudo:
                 continue
-            per_k = pseudo[gap_idx]
+            gap_pseudo = pseudo[gap_idx]  # per-sample: list[slot]; legacy: {k: flows}
             for k_idx, flow_dict in enumerate(gap_flows):
-                # Resolve k from per-gap dict or flat list
-                if isinstance(self.interp_steps, dict):
-                    gap_steps = self.interp_steps.get(gap_idx, list(range(1, self.tsf)))
-                    k = gap_steps[k_idx] if k_idx < len(gap_steps) else k_idx + 1
-                elif self.interp_steps is not None:
-                    k = self.interp_steps[k_idx]
+                if per_sample:
+                    # Network slots and pseudo-GT slots are emitted in the same
+                    # order, so they match directly by index.
+                    if k_idx >= len(gap_pseudo):
+                        continue
+                    gt_flows = gap_pseudo[k_idx]
                 else:
-                    k = k_idx + 1
-                if k not in per_k:
-                    continue
-                gt_flows = per_k[k]
+                    # Legacy: resolve the scalar sub-step k for this slot.
+                    if isinstance(self.interp_steps, dict):
+                        gap_steps = self.interp_steps.get(gap_idx, list(range(1, self.tsf)))
+                        k = gap_steps[k_idx] if k_idx < len(gap_steps) else k_idx + 1
+                    elif self.interp_steps is not None:
+                        k = self.interp_steps[k_idx]
+                    else:
+                        k = k_idx + 1
+                    if k not in gap_pseudo:
+                        continue
+                    gt_flows = gap_pseudo[k]
                 if "l2v" in flow_dict and "r2v" in flow_dict:
                     total = total + F.l1_loss(flow_dict["l2v"], gt_flows["l2v"])
                     total = total + F.l1_loss(flow_dict["r2v"], gt_flows["r2v"])
