@@ -323,6 +323,7 @@ def define_G(opt):
             learned_surrogate_blend=opt_net.get("learned_surrogate_blend", True),
             interp_flow_mode=opt_net.get("interp_flow_mode", "quadratic"),
             unified_prior_adapter=opt_net.get("unified_prior_adapter", True),
+            use_anti_ghost=opt_net.get("use_anti_ghost", True)
         )
 
     else:
