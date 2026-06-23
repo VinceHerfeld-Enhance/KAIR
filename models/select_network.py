@@ -326,9 +326,9 @@ def define_G(opt):
             learned_surrogate_blend=opt_net.get("learned_surrogate_blend", True),
             interp_flow_mode=opt_net.get("interp_flow_mode", "quadratic"),
             unified_prior_adapter=opt_net.get("unified_prior_adapter", True),
-            use_anti_ghost=opt_net.get("use_anti_ghost", True)
-        )
-
+            use_anti_ghost=opt_net.get("use_anti_ghost", True),
+            bspline_windowed=opt_net.get("bspline_windowed", True),
+            bspline_confidence_splat=opt_net.get("bspline_confidence_splat", True)
     else:
         raise NotImplementedError("netG [{:s}] is not found.".format(net_type))
 
