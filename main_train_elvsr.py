@@ -2,9 +2,8 @@ import sys
 import os.path
 import math
 import argparse
-import warnings
+import re
 
-import time
 import random
 import cv2
 import numpy as np
@@ -12,43 +11,49 @@ from collections import OrderedDict
 import logging
 import torch
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 
 from utils import utils_logger
 from utils import utils_image as util
 from utils import utils_option as option
-from utils.utils_dist import get_dist_info, init_dist
 
 from data.select_dataset import define_Dataset
 from models.select_model import define_Model
 
 import wandb
+from accelerate import Accelerator
+from accelerate.utils import set_seed
+from accelerate.utils import DistributedDataParallelKwargs
 
 
 def _dataloader_worker_init(worker_id):
     """Disable OpenCV's internal thread pool inside each dataloader worker.
 
-    Without this, every worker lets cv2.imdecode spawn its own threads, so 16
+    Without this, every worker lets cv2.imdecode spawn its own threads, so the
     workers oversubscribe the CPU and decode latency becomes erratic -> the
-    prefetch queue drains unevenly and GPU utilisation oscillates. Re-applied
-    here (not only at module import) so it holds under the 'spawn' start method.
+    prefetch queue drains unevenly and GPU utilisation oscillates. Applied via
+    worker_init_fn so it holds under the 'spawn' start method (Accelerate).
     """
     cv2.setNumThreads(0)
     cv2.ocl.setUseOpenCL(False)
 
 
-def _build_dataloader_kwargs(dataset_opt, runtime_opt=None, phase="train", distributed=False, num_gpu=1):
+def _build_dataloader_kwargs(dataset_opt, runtime_opt=None, phase="train", world_size=1):
+    """Build DataLoader kwargs, including the runtime perf knobs.
+
+    Distribution is handled by Accelerate (it shards the prepared loader), so we
+    keep ``shuffle`` from config and only divide the per-process batch/worker
+    counts by ``world_size`` to keep the effective global batch size constant.
+    """
     runtime_opt = runtime_opt or {}
     loader_opt = runtime_opt.get("dataloader", {}) if isinstance(runtime_opt.get("dataloader", {}), dict) else {}
 
     if phase == "train":
-        batch_size = (
-            dataset_opt["dataloader_batch_size"] // num_gpu if distributed else dataset_opt["dataloader_batch_size"]
-        )
-        num_workers = (
-            dataset_opt["dataloader_num_workers"] // num_gpu if distributed else dataset_opt["dataloader_num_workers"]
-        )
-        shuffle = False if distributed else dataset_opt["dataloader_shuffle"]
+        batch_size = dataset_opt["dataloader_batch_size"]
+        num_workers = dataset_opt["dataloader_num_workers"]
+        if world_size > 1:
+            batch_size = max(1, batch_size // world_size)
+            num_workers = num_workers // world_size
+        shuffle = dataset_opt["dataloader_shuffle"]
         default_prefetch = 4
     else:
         batch_size = dataset_opt.get("dataloader_batch_size", 1)
@@ -98,25 +103,9 @@ def _setup_runtime_performance(opt, logger=None):
         else:
             print(msg)
 
-        loader_opt = perf_opt.get("dataloader", {}) if isinstance(perf_opt.get("dataloader", {}), dict) else {}
-        if loader_opt:
-            loader_msg = (
-                "Runtime dataloader: "
-                f"pin_memory={bool(loader_opt.get('pin_memory', True))}, "
-                f"persistent_workers={bool(loader_opt.get('persistent_workers', True))}, "
-                f"prefetch_factor={int(loader_opt.get('prefetch_factor', 4))}, "
-                f"val_num_workers={int(loader_opt.get('val_num_workers', 2))}"
-            )
-            if logger is not None:
-                logger.info(loader_msg)
-            else:
-                print(loader_msg)
-
 
 def _extract_frame_number(filename):
     """Extract the numeric frame index from a filename like '00017.png' or 'frame_000017.png'."""
-    import re
-
     stem = os.path.splitext(filename)[0]
     numbers = re.findall(r"\d+", stem)
     return int(numbers[-1]) if numbers else None
@@ -157,6 +146,10 @@ def _load_test_lr_indices(test_list_dir, folder_name, all_gt_paths):
 """
 # --------------------------------------------
 # training code for ELVSR
+# Uses HuggingFace Accelerate for (optional) DDP.
+#   - single GPU:   python main_train_elvsr.py --opt path/to/config.json
+#   - multi GPU:    accelerate launch main_train_elvsr.py --opt path/to/config.json
+#                   idr_accelerate main_train_elvsr.py --opt path/to/config.json
 # Supports temporal super-resolution (TSR):
 #   When netG.tsf > 1, the LR input is temporally subsampled
 #   by keeping every tsf-th frame. The model reconstructs
@@ -164,6 +157,23 @@ def _load_test_lr_indices(test_list_dir, folder_name, all_gt_paths):
 #   full HR sequence.
 # --------------------------------------------
 """
+
+
+def _accelerate_mixed_precision(opt):
+    """Map the config AMP options to an Accelerate ``mixed_precision`` string.
+
+    Under Accelerate, mixed precision / loss scaling is owned by the accelerator
+    (the prepared model's forward runs under autocast and ``accelerator.backward``
+    handles scaling). The model's internal AMP scaler is therefore disabled, so
+    we translate ``use_amp``/``amp_dtype`` into the accelerator's setting instead.
+    """
+    train_opt = opt.get("train", {}) if isinstance(opt, dict) else {}
+    if not bool(train_opt.get("use_amp", False)):
+        return "no"
+    dtype_name = str(train_opt.get("amp_dtype", "float16")).strip().lower()
+    if dtype_name in ("bfloat16", "bf16"):
+        return "bf16"
+    return "fp16"
 
 
 def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json"):
@@ -175,31 +185,48 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--opt", type=str, default=json_path, help="Path to option JSON file.")
-    parser.add_argument("--launcher", default="pytorch", help="job launcher")
-    parser.add_argument("--local-rank", type=int, default=0)
-    parser.add_argument("--dist", default=False)
+    args = parser.parse_args()
 
-    opt = option.parse(parser.parse_args().opt, is_train=True)
-    opt["dist"] = parser.parse_args().dist
+    opt = option.parse(args.opt, is_train=True)
 
     # ----------------------------------------
-    # distributed settings
+    # Initialize Accelerator (handles DDP automatically; single-process when
+    # launched with plain `python`). Mixed precision is delegated to the
+    # accelerator, so the model's internal AMP path is disabled below.
     # ----------------------------------------
-    if opt["dist"]:
-        init_dist("pytorch")
-    opt["rank"], opt["world_size"] = get_dist_info()
-    # assign GPU to each distributed process
-    if opt["dist"]:
-        torch.cuda.set_device(parser.parse_args().local_rank)
-    if opt["rank"] == 0:
+    mixed_precision = _accelerate_mixed_precision(opt)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=opt.get("find_unused_parameters", True))
+    accelerator = Accelerator(mixed_precision=mixed_precision, kwargs_handlers=[ddp_kwargs])
+    device = accelerator.device
+    is_main = accelerator.is_main_process
+    rank = accelerator.process_index
+    world_size = accelerator.num_processes
+
+    # Distribution is owned by Accelerate, not KAIR's native DDP wrapping.
+    opt["dist"] = False
+    opt["rank"] = rank
+    opt["world_size"] = world_size
+    opt["num_gpu"] = world_size
+    # Disable the model's own AMP scaler/autocast — the accelerator provides it.
+    if opt.get("train") is not None:
+        opt["train"]["use_amp"] = False
+
+    if is_main:
         util.mkdirs((path for key, path in opt["path"].items() if "pretrained" not in key))
 
-    if opt["rank"] == 0:
-        wandb.init(project="KAIR_VideoSR", name=opt["task"] if "task" in opt else "run", config=opt)
+    # Wait for main process to create directories
+    accelerator.wait_for_everyone()
+
+    if is_main:
+        wandb.init(
+            project="KAIR_VideoSR",
+            name=opt["task"] if "task" in opt else "run",
+            config=opt,
+        )
+
     # ----------------------------------------
-    # update opt
+    # update opt — find last checkpoint
     # ----------------------------------------
-    # -->-->-->-->-->-->-->-->-->-->-->-->-->-
     init_iter_G, init_path_G = option.find_last_checkpoint(
         opt["path"]["models"], net_type="G", pretrained_path=opt["path"]["pretrained_netG"]
     )
@@ -214,12 +241,10 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     opt["path"]["pretrained_optimizerG"] = init_path_optimizerG
     current_step = max(init_iter_G, init_iter_E, init_iter_optimizerG)
 
-    # --<--<--<--<--<--<--<--<--<--<--<--<--<-
-
     # ----------------------------------------
     # save opt to  a '../option.json' file
     # ----------------------------------------
-    if opt["rank"] == 0:
+    if is_main:
         option.save(opt)
 
     # ----------------------------------------
@@ -228,9 +253,10 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     opt = option.dict_to_nonedict(opt)
 
     # ----------------------------------------
-    # configure logger
+    # configure logger (only on main process)
     # ----------------------------------------
-    if opt["rank"] == 0:
+    logger = None
+    if is_main:
         logger_name = "train"
         utils_logger.logger_info(logger_name, os.path.join(opt["path"]["log"], logger_name + ".log"))
         logger = logging.getLogger(logger_name)
@@ -240,23 +266,22 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
         _setup_runtime_performance(opt, None)
 
     # ----------------------------------------
-    # seed
+    # seed — use accelerate's set_seed for reproducibility across processes
     # ----------------------------------------
     seed = opt["train"]["manual_seed"]
     if seed is None:
         seed = random.randint(1, 10000)
-    print("Random seed: {}".format(seed))
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    # Each process gets a different seed offset for data augmentation diversity.
+    if is_main:
+        print("Base random seed: {}".format(seed))
+    set_seed(seed + rank)
 
     # ----------------------------------------
     # temporal scale factor (TSR)
     # ----------------------------------------
     tsf = int(opt["netG"].get("tsf", 1)) if opt["netG"] is not None else 1
     n_interp_samples = int(opt["train"]["n_interp_samples"]) if opt["train"]["n_interp_samples"] else None
-    if tsf > 1 and opt["rank"] == 0:
+    if tsf > 1 and is_main:
         logger.info(f"Temporal super-resolution enabled: tsf={tsf}")
         if n_interp_samples is not None:
             assert 1 <= n_interp_samples < tsf, f"n_interp_samples ({n_interp_samples}) must be in [1, tsf-1={tsf - 1}]"
@@ -274,46 +299,28 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
 
     """
     # ----------------------------------------
-    # Step--2 (creat dataloader)
+    # Step--2 (create dataloader)
     # ----------------------------------------
     """
 
-    # ----------------------------------------
-    # 1) create_dataset
-    # 2) creat_dataloader for train and test
-    # ----------------------------------------
+    test_loader = None
+    runtime_opt = opt.get("train", {}).get("runtime", {})
+
     for phase, dataset_opt in opt["datasets"].items():
         if phase == "train":
             train_set = define_Dataset(dataset_opt)
             train_size = int(math.ceil(len(train_set) / dataset_opt["dataloader_batch_size"]))
-            if opt["rank"] == 0:
+            if is_main:
                 logger.info("Number of train images: {:,d}, iters: {:,d}".format(len(train_set), train_size))
+            # Accelerate shards the prepared loader across processes.
             train_loader_kwargs = _build_dataloader_kwargs(
-                dataset_opt,
-                opt.get("train", {}).get("runtime", {}),
-                phase="train",
-                distributed=opt["dist"],
-                num_gpu=opt["num_gpu"],
+                dataset_opt, runtime_opt, phase="train", world_size=world_size
             )
-            if opt["dist"]:
-                train_sampler = DistributedSampler(
-                    train_set, shuffle=dataset_opt["dataloader_shuffle"], drop_last=True, seed=seed
-                )
-                train_loader = DataLoader(
-                    train_set,
-                    sampler=train_sampler,
-                    **train_loader_kwargs,
-                )
-            else:
-                train_loader = DataLoader(train_set, **train_loader_kwargs)
+            train_loader = DataLoader(train_set, **train_loader_kwargs)
 
         elif phase == "test":
             test_set = define_Dataset(dataset_opt)
-            test_loader_kwargs = _build_dataloader_kwargs(
-                dataset_opt,
-                opt.get("train", {}).get("runtime", {}),
-                phase="test",
-            )
+            test_loader_kwargs = _build_dataloader_kwargs(dataset_opt, runtime_opt, phase="test")
             test_loader = DataLoader(test_set, **test_loader_kwargs)
         else:
             raise NotImplementedError("Phase [%s] is not recognized." % phase)
@@ -325,10 +332,22 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     """
 
     model = define_Model(opt)
+    # Wire the accelerator into the model BEFORE init_train so loss modules and
+    # data tensors are created on the correct per-process device.
+    model.accelerator = accelerator
+    model.device = device
     model.init_train()
-    if opt["rank"] == 0:
+    if is_main:
         logger.info(model.info_network())
         logger.info(model.info_params())
+
+    # ----------------------------------------
+    # Prepare model internals with Accelerator (DDP, mixed precision, sharding).
+    # The EMA network (if any) is moved manually — it is not optimized.
+    # ----------------------------------------
+    model.netG, model.G_optimizer, train_loader = accelerator.prepare(model.netG, model.G_optimizer, train_loader)
+    if getattr(model, "netE", None) is not None:
+        model.netE = model.netE.to(device)
 
     """
     # ----------------------------------------
@@ -339,6 +358,11 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     total_iter = opt["train"]["total_iter"]
     epoch = 0
     while current_step < total_iter:  # keep running
+
+        # Accelerate's dataloader handles setting the epoch for the internal sampler
+        if hasattr(train_loader, "set_epoch"):
+            train_loader.set_epoch(epoch)
+
         for i, train_data in enumerate(train_loader):
 
             current_step += 1
@@ -418,25 +442,23 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
             # -------------------------------
             # 4) training information
             # -------------------------------
-            if current_step % opt["train"]["checkpoint_print"] == 0 and opt["rank"] == 0:
-                model.log_psnr()  # calculate PSNR for the current batch, which is used for logging but not optimization
-                logs = model.current_log()  # such as loss
+            if current_step % opt["train"]["checkpoint_print"] == 0 and is_main:
+                model.log_psnr()
+                logs = model.current_log()
                 message = "<epoch:{:3d}, iter:{:8,d}, lr:{:.3e}> ".format(
                     epoch, current_step, model.current_learning_rate()
                 )
-                for k, v in logs.items():  # merge log information into message
+                for k, v in logs.items():
                     message += "{:s}: {:.3e} ".format(k, v)
                 logger.info(message)
-                if opt["rank"] == 0:
-                    wandb_log = {f"train/{k}": v for k, v in logs.items()}
-                    wandb_log["train/lr"] = model.current_learning_rate()
-                    wandb.log(wandb_log, step=current_step)
+                wandb.log({f"train/{k}": v for k, v in logs.items()}, step=current_step)
+                wandb.log({"train/lr": model.current_learning_rate()}, step=current_step)
 
             # -------------------------------
             # 4b) debug: save train frames
             # -------------------------------
             debug_every = opt["train"]["checkpoint_debug_frames"] if opt["train"] else None
-            if debug_every and current_step % debug_every == 0 and opt["rank"] == 0:
+            if debug_every and current_step % debug_every == 0 and is_main:
                 visuals = model.current_visuals()  # L: [T_in,C,H,W], E: [T_out,C,H,W], H: [T_out,C,H,W]
                 debug_dir = os.path.join(opt["path"]["images"], "debug_train")
                 for key in ["L", "E", "H"]:
@@ -456,267 +478,179 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
             # -------------------------------
             # 5) save model
             # -------------------------------
-            if current_step % opt["train"]["checkpoint_save"] == 0 and opt["rank"] == 0:
+            if current_step % opt["train"]["checkpoint_save"] == 0 and is_main:
                 logger.info("Saving the model.")
+                # save_network unwraps the DDP-wrapped netG (get_bare_model), so
+                # checkpoints stay compatible with single-GPU / non-DDP loading.
                 model.save(current_step)
 
             # -------------------------------
-            # 6) testing
+            # 6) testing (only on main process)
             # -------------------------------
-            if current_step % opt["train"]["checkpoint_test"] == 0 and opt["rank"] == 0:
-
-                test_results = OrderedDict()
-                test_results["psnr"] = []
-                test_results["ssim"] = []
-                test_results["psnr_y"] = []
-                test_results["ssim_y"] = []
-
-                test_list_dir = opt["datasets"]["test"].get("test_list_dir", None) if opt["datasets"]["test"] else None
-
-                for idx, test_data in enumerate(test_loader):
-                    folder = test_data["folder"]
-
-                    if test_list_dir is not None:
-                        # Adobe240-style: LQ and GT are already filtered by
-                        # the dataset to only include the effective frames.
-                        pass
-                    elif tsf > 1:
-                        test_data["L"] = test_data["L"][:, ::tsf]
-
-                    model.feed_data(test_data)
-                    model.test()
-
-                    visuals = model.current_visuals()
-                    output = visuals["E"]
-                    gt = visuals["H"] if "H" in visuals else None
-
-                    # For temporal SR the model may output fewer frames than
-                    # the full GT sequence (when T-1 is not divisible by tsf).
-                    # Trim GT to match output length.
-                    if gt is not None and gt.shape[0] > output.shape[0]:
-                        gt = gt[: output.shape[0]]
-
-                    # -------------------------------
-                    # debug: save L / E / H frames for first test video
-                    # -------------------------------
-                    if idx == torch.randint(0, len(test_loader) - 1, (1,)).item() and opt["train"]["checkpoint_debug_frames"] and opt["rank"] == 0:
-                        debug_val_dir = os.path.join(
-                            opt["path"]["images"], "debug_val", f"iter_{current_step:08d}", folder[0]
-                        )
-                        lr_frames = visuals["L"]  # [T_lq, C, H, W]
-
-                        modalities = [("E", output)]
-                        if not saved_fixed:
-                            modalities.insert(0, ("L", lr_frames))
-                            modalities.append(("H", gt))
-                            saved_fixed = True
-                        for key, frames in modalities:
-                            if frames is None:
-                                continue
-                            out_dir = os.path.join(debug_val_dir, key)
-                            os.makedirs(out_dir, exist_ok=True)
-                            for fi in range(frames.shape[0]):
-                                fr = frames[fi].clamp_(0, 1).numpy()
-                                if fr.ndim == 3:
-                                    fr = np.transpose(fr[[2, 1, 0], :, :], (1, 2, 0))
-                                fr = (fr * 255.0).round().astype(np.uint8)
-                                cv2.imwrite(os.path.join(out_dir, f"{fi:05d}.png"), fr)
-                        logger.info(
-                            f"Debug val frames saved: {debug_val_dir}/ "
-                            f"(L={lr_frames.shape[0]}, E={output.shape[0]}, H={gt.shape[0] if gt is not None else 0})"
-                        )
-
-                    test_results_folder = OrderedDict()
-                    test_results_folder["psnr"] = []
-                    test_results_folder["ssim"] = []
-                    test_results_folder["psnr_y"] = []
-                    test_results_folder["ssim_y"] = []
-
-                    for i in range(output.shape[0]):
-                        # -----------------------
-                        # save estimated image E
-                        # -----------------------
-                        img = output[i, ...].clamp_(0, 1).numpy()
-                        if img.ndim == 3:
-                            img = np.transpose(img[[2, 1, 0], :, :], (1, 2, 0))  # CHW-RGB to HCW-BGR
-                        img = (img * 255.0).round().astype(np.uint8)  # float32 to uint8
-                        if opt["val"]["save_img"]:
-                            save_dir = opt["path"]["images"]
-                            util.mkdir(save_dir)
-                            seq_ = os.path.basename(test_data["lq_path"][i][0]).split(".")[0]
-                            os.makedirs(f"{save_dir}/{folder[0]}", exist_ok=True)
-                            cv2.imwrite(f"{save_dir}/{folder[0]}/{seq_}_{current_step:d}.png", img)
-
-                        # -----------------------
-                        # calculate PSNR
-                        # -----------------------
-                        img_gt = gt[i, ...].clamp_(0, 1).numpy()
-                        if img_gt.ndim == 3:
-                            img_gt = np.transpose(img_gt[[2, 1, 0], :, :], (1, 2, 0))  # CHW-RGB to HCW-BGR
-                        img_gt = (img_gt * 255.0).round().astype(np.uint8)  # float32 to uint8
-                        img_gt = np.squeeze(img_gt)
-
-                        test_results_folder["psnr"].append(util.calculate_psnr(img, img_gt, border=0))
-                        test_results_folder["ssim"].append(util.calculate_ssim(img, img_gt, border=0))
-                        if img_gt.ndim == 3:  # RGB image
-                            img = util.bgr2ycbcr(img.astype(np.float32) / 255.0) * 255.0
-                            img_gt = util.bgr2ycbcr(img_gt.astype(np.float32) / 255.0) * 255.0
-                            test_results_folder["psnr_y"].append(util.calculate_psnr(img, img_gt, border=0))
-                            test_results_folder["ssim_y"].append(util.calculate_ssim(img, img_gt, border=0))
-                        else:
-                            test_results_folder["psnr_y"] = test_results_folder["psnr"]
-                            test_results_folder["ssim_y"] = test_results_folder["ssim"]
-
-                    psnr = sum(test_results_folder["psnr"]) / len(test_results_folder["psnr"])
-                    ssim = sum(test_results_folder["ssim"]) / len(test_results_folder["ssim"])
-                    psnr_y = sum(test_results_folder["psnr_y"]) / len(test_results_folder["psnr_y"])
-                    ssim_y = sum(test_results_folder["ssim_y"]) / len(test_results_folder["ssim_y"])
-
-                    if gt is not None:
-                        logger.info(
-                            "Testing {:20s} ({:2d}/{}) - PSNR: {:.2f} dB; SSIM: {:.4f}; "
-                            "PSNR_Y: {:.2f} dB; SSIM_Y: {:.4f}".format(
-                                folder[0], idx, len(test_loader), psnr, ssim, psnr_y, ssim_y
-                            )
-                        )
-                        test_results["psnr"].append(psnr)
-                        test_results["ssim"].append(ssim)
-                        test_results["psnr_y"].append(psnr_y)
-                        test_results["ssim_y"].append(ssim_y)
-                    else:
-                        logger.info("Testing {:20s}  ({:2d}/{})".format(folder[0], idx, len(test_loader)))
-
-                # summarize psnr/ssim
-                if gt is not None:
-                    ave_psnr = sum(test_results["psnr"]) / len(test_results["psnr"])
-                    ave_ssim = sum(test_results["ssim"]) / len(test_results["ssim"])
-                    ave_psnr_y = sum(test_results["psnr_y"]) / len(test_results["psnr_y"])
-                    ave_ssim_y = sum(test_results["ssim_y"]) / len(test_results["ssim_y"])
-                    logger.info(
-                        "<epoch:{:3d}, iter:{:8,d} Average PSNR: {:.2f} dB; SSIM: {:.4f}; "
-                        "PSNR_Y: {:.2f} dB; SSIM_Y: {:.4f}".format(
-                            epoch, current_step, ave_psnr, ave_ssim, ave_psnr_y, ave_ssim_y
-                        )
+            if current_step % opt["train"]["checkpoint_test"] == 0 and is_main:
+                if test_loader is not None:
+                    saved_fixed = _run_validation(
+                        model, test_loader, opt, logger, epoch, current_step, tsf, saved_fixed
                     )
-                    if opt["rank"] == 0:
-                        wandb.log(
-                            {
-                                "val/PSNR": ave_psnr,
-                                "val/SSIM": ave_ssim,
-                                "val/PSNR_Y": ave_psnr_y,
-                                "val/SSIM_Y": ave_ssim_y,
-                            },
-                            step=current_step,
-                        )
+
         epoch += 1
 
-    logger.info("Finish training.")
-    model.save(current_step)
+    if is_main:
+        logger.info("Finish training.")
+        model.save(current_step)
 
-    # Final validation at last iteration
-    if opt["rank"] == 0 and test_loader is not None:
-        test_results = OrderedDict()
-        test_results["psnr"] = []
-        test_results["ssim"] = []
-        test_results["psnr_y"] = []
-        test_results["ssim_y"] = []
+        # Final validation at last iteration
+        if test_loader is not None:
+            _run_validation(model, test_loader, opt, logger, epoch, current_step, tsf, saved_fixed)
 
-        test_list_dir = opt["datasets"]["test"].get("test_list_dir", None) if opt["datasets"]["test"] else None
-
-        for idx, test_data in enumerate(test_loader):
-            folder = test_data["folder"]
-
-            if test_list_dir is not None:
-                pass
-            elif tsf > 1:
-                test_data["L"] = test_data["L"][:, ::tsf]
-
-            model.feed_data(test_data)
-            model.test()
-
-            visuals = model.current_visuals()
-            output = visuals["E"]
-            gt = visuals["H"] if "H" in visuals else None
-
-            if gt is not None and gt.shape[0] > output.shape[0]:
-                gt = gt[: output.shape[0]]
-
-            test_results_folder = OrderedDict()
-            test_results_folder["psnr"] = []
-            test_results_folder["ssim"] = []
-            test_results_folder["psnr_y"] = []
-            test_results_folder["ssim_y"] = []
-
-            for i in range(output.shape[0]):
-                img = output[i, ...].clamp_(0, 1).numpy()
-                if img.ndim == 3:
-                    img = np.transpose(img[[2, 1, 0], :, :], (1, 2, 0))
-                img = (img * 255.0).round().astype(np.uint8)
-                if opt["val"]["save_img"]:
-                    save_dir = opt["path"]["images"]
-                    util.mkdir(save_dir)
-                    seq_ = os.path.basename(test_data["lq_path"][i][0]).split(".")[0]
-                    os.makedirs(f"{save_dir}/{folder[0]}", exist_ok=True)
-                    cv2.imwrite(f"{save_dir}/{folder[0]}/{seq_}_{current_step:d}.png", img)
-
-                if gt is not None:
-                    img_gt = gt[i, ...].clamp_(0, 1).numpy()
-                    if img_gt.ndim == 3:
-                        img_gt = np.transpose(img_gt[[2, 1, 0], :, :], (1, 2, 0))
-                    img_gt = (img_gt * 255.0).round().astype(np.uint8)
-                    img_gt = np.squeeze(img_gt)
-
-                    test_results_folder["psnr"].append(util.calculate_psnr(img, img_gt, border=0))
-                    test_results_folder["ssim"].append(util.calculate_ssim(img, img_gt, border=0))
-                    if img_gt.ndim == 3:
-                        img = util.bgr2ycbcr(img.astype(np.float32) / 255.0) * 255.0
-                        img_gt = util.bgr2ycbcr(img_gt.astype(np.float32) / 255.0) * 255.0
-                        test_results_folder["psnr_y"].append(util.calculate_psnr(img, img_gt, border=0))
-                        test_results_folder["ssim_y"].append(util.calculate_ssim(img, img_gt, border=0))
-                    else:
-                        test_results_folder["psnr_y"] = test_results_folder["psnr"]
-                        test_results_folder["ssim_y"] = test_results_folder["ssim"]
-
-            if gt is not None and len(test_results_folder["psnr"]) > 0:
-                psnr = sum(test_results_folder["psnr"]) / len(test_results_folder["psnr"])
-                ssim = sum(test_results_folder["ssim"]) / len(test_results_folder["ssim"])
-                psnr_y = sum(test_results_folder["psnr_y"]) / len(test_results_folder["psnr_y"])
-                ssim_y = sum(test_results_folder["ssim_y"]) / len(test_results_folder["ssim_y"])
-                logger.info(
-                    "Testing {:20s} ({:2d}/{}) - PSNR: {:.2f} dB; SSIM: {:.4f}; "
-                    "PSNR_Y: {:.2f} dB; SSIM_Y: {:.4f}".format(
-                        folder[0], idx, len(test_loader), psnr, ssim, psnr_y, ssim_y
-                    )
-                )
-                test_results["psnr"].append(psnr)
-                test_results["ssim"].append(ssim)
-                test_results["psnr_y"].append(psnr_y)
-                test_results["ssim_y"].append(ssim_y)
-            else:
-                logger.info("Testing {:20s}  ({:2d}/{})".format(folder[0], idx, len(test_loader)))
-
-        if len(test_results["psnr"]) > 0:
-            ave_psnr = sum(test_results["psnr"]) / len(test_results["psnr"])
-            ave_ssim = sum(test_results["ssim"]) / len(test_results["ssim"])
-            ave_psnr_y = sum(test_results["psnr_y"]) / len(test_results["psnr_y"])
-            ave_ssim_y = sum(test_results["ssim_y"]) / len(test_results["ssim_y"])
-            logger.info(
-                "<Final, iter:{:8,d} Average PSNR: {:.2f} dB; SSIM: {:.4f}; "
-                "PSNR_Y: {:.2f} dB; SSIM_Y: {:.4f}".format(current_step, ave_psnr, ave_ssim, ave_psnr_y, ave_ssim_y)
-            )
-            wandb.log(
-                {
-                    "val/PSNR": ave_psnr,
-                    "val/SSIM": ave_ssim,
-                    "val/PSNR_Y": ave_psnr_y,
-                    "val/SSIM_Y": ave_ssim_y,
-                },
-                step=current_step,
-            )
-
-    if opt["rank"] == 0:
         wandb.finish()
+    accelerator.wait_for_everyone()
     sys.exit()
+
+
+def _run_validation(model, test_loader, opt, logger, epoch, current_step, tsf, saved_fixed):
+    """Run validation loop, compute metrics, log to wandb. Returns updated saved_fixed."""
+
+    test_results = OrderedDict()
+    test_results["psnr"] = []
+    test_results["ssim"] = []
+    test_results["psnr_y"] = []
+    test_results["ssim_y"] = []
+
+    test_list_dir = opt["datasets"]["test"].get("test_list_dir", None) if opt["datasets"]["test"] else None
+
+    for idx, test_data in enumerate(test_loader):
+        folder = test_data["folder"]
+
+        if test_list_dir is not None:
+            # Adobe240-style: LQ and GT are already filtered by
+            # the dataset to only include the effective frames.
+            pass
+        elif tsf > 1:
+            test_data["L"] = test_data["L"][:, ::tsf]
+
+        model.feed_data(test_data)
+        model.test()
+
+        visuals = model.current_visuals()
+        output = visuals["E"]
+        gt = visuals["H"] if "H" in visuals else None
+
+        # For temporal SR the model may output fewer frames than
+        # the full GT sequence (when T-1 is not divisible by tsf).
+        # Trim GT to match output length.
+        if gt is not None and gt.shape[0] > output.shape[0]:
+            gt = gt[: output.shape[0]]
+
+        # -------------------------------
+        # debug: save L / E / H frames for one test video
+        # -------------------------------
+        if idx == 1 and opt["train"]["checkpoint_debug_frames"]:
+            debug_val_dir = os.path.join(opt["path"]["images"], "debug_val", f"iter_{current_step:08d}", folder[0])
+            lr_frames = visuals["L"]  # [T_lq, C, H, W]
+
+            modalities = [("E", output)]
+            if not saved_fixed:
+                modalities.insert(0, ("L", lr_frames))
+                modalities.append(("H", gt))
+                saved_fixed = True
+            for key, frames in modalities:
+                if frames is None:
+                    continue
+                out_dir = os.path.join(debug_val_dir, key)
+                os.makedirs(out_dir, exist_ok=True)
+                for fi in range(frames.shape[0]):
+                    fr = frames[fi].clamp_(0, 1).numpy()
+                    if fr.ndim == 3:
+                        fr = np.transpose(fr[[2, 1, 0], :, :], (1, 2, 0))
+                    fr = (fr * 255.0).round().astype(np.uint8)
+                    cv2.imwrite(os.path.join(out_dir, f"{fi:05d}.png"), fr)
+            logger.info(
+                f"Debug val frames saved: {debug_val_dir}/ "
+                f"(L={lr_frames.shape[0]}, E={output.shape[0]}, H={gt.shape[0] if gt is not None else 0})"
+            )
+
+        test_results_folder = OrderedDict()
+        test_results_folder["psnr"] = []
+        test_results_folder["ssim"] = []
+        test_results_folder["psnr_y"] = []
+        test_results_folder["ssim_y"] = []
+
+        for j in range(output.shape[0]):
+            # -----------------------
+            # save estimated image E
+            # -----------------------
+            img = output[j, ...].clamp_(0, 1).numpy()
+            if img.ndim == 3:
+                img = np.transpose(img[[2, 1, 0], :, :], (1, 2, 0))  # CHW-RGB to HCW-BGR
+            img = (img * 255.0).round().astype(np.uint8)
+
+            if opt["val"]["save_img"]:
+                save_dir = opt["path"]["images"]
+                util.mkdir(save_dir)
+                seq_ = os.path.basename(test_data["lq_path"][j][0]).split(".")[0]
+                os.makedirs(f"{save_dir}/{folder[0]}", exist_ok=True)
+                cv2.imwrite(f"{save_dir}/{folder[0]}/{seq_}_{current_step:d}.png", img)
+
+            # -----------------------
+            # calculate PSNR / SSIM
+            # -----------------------
+            if gt is not None:
+                img_gt = gt[j, ...].clamp_(0, 1).numpy()
+                if img_gt.ndim == 3:
+                    img_gt = np.transpose(img_gt[[2, 1, 0], :, :], (1, 2, 0))  # CHW-RGB to HCW-BGR
+                img_gt = (img_gt * 255.0).round().astype(np.uint8)
+                img_gt = np.squeeze(img_gt)
+
+                test_results_folder["psnr"].append(util.calculate_psnr(img, img_gt, border=0))
+                test_results_folder["ssim"].append(util.calculate_ssim(img, img_gt, border=0))
+                if img_gt.ndim == 3:  # RGB image
+                    img = util.bgr2ycbcr(img.astype(np.float32) / 255.0) * 255.0
+                    img_gt = util.bgr2ycbcr(img_gt.astype(np.float32) / 255.0) * 255.0
+                    test_results_folder["psnr_y"].append(util.calculate_psnr(img, img_gt, border=0))
+                    test_results_folder["ssim_y"].append(util.calculate_ssim(img, img_gt, border=0))
+                else:
+                    test_results_folder["psnr_y"] = test_results_folder["psnr"]
+                    test_results_folder["ssim_y"] = test_results_folder["ssim"]
+
+        if gt is not None and len(test_results_folder["psnr"]) > 0:
+            psnr = sum(test_results_folder["psnr"]) / len(test_results_folder["psnr"])
+            ssim = sum(test_results_folder["ssim"]) / len(test_results_folder["ssim"])
+            psnr_y = sum(test_results_folder["psnr_y"]) / len(test_results_folder["psnr_y"])
+            ssim_y = sum(test_results_folder["ssim_y"]) / len(test_results_folder["ssim_y"])
+
+            logger.info(
+                "Testing {:20s} ({:2d}/{}) - PSNR: {:.2f} dB; SSIM: {:.4f}; "
+                "PSNR_Y: {:.2f} dB; SSIM_Y: {:.4f}".format(folder[0], idx, len(test_loader), psnr, ssim, psnr_y, ssim_y)
+            )
+            test_results["psnr"].append(psnr)
+            test_results["ssim"].append(ssim)
+            test_results["psnr_y"].append(psnr_y)
+            test_results["ssim_y"].append(ssim_y)
+        else:
+            logger.info("Testing {:20s}  ({:2d}/{})".format(folder[0], idx, len(test_loader)))
+
+    # summarize psnr/ssim
+    if len(test_results["psnr"]) > 0:
+        ave_psnr = sum(test_results["psnr"]) / len(test_results["psnr"])
+        ave_ssim = sum(test_results["ssim"]) / len(test_results["ssim"])
+        ave_psnr_y = sum(test_results["psnr_y"]) / len(test_results["psnr_y"])
+        ave_ssim_y = sum(test_results["ssim_y"]) / len(test_results["ssim_y"])
+        logger.info(
+            "<epoch:{:3d}, iter:{:8,d} Average PSNR: {:.2f} dB; SSIM: {:.4f}; "
+            "PSNR_Y: {:.2f} dB; SSIM_Y: {:.4f}".format(epoch, current_step, ave_psnr, ave_ssim, ave_psnr_y, ave_ssim_y)
+        )
+        wandb.log(
+            {
+                "val/PSNR": ave_psnr,
+                "val/SSIM": ave_ssim,
+                "val/PSNR_Y": ave_psnr_y,
+                "val/SSIM_Y": ave_ssim_y,
+            },
+            step=current_step,
+        )
+
+    return saved_fixed
 
 
 if __name__ == "__main__":

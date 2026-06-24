@@ -265,11 +265,18 @@ class ModelPlain(ModelBase):
     def optimize_parameters(self, current_step):
         self.G_optimizer.zero_grad()
 
+        # When training under HuggingFace Accelerate, mixed precision, gradient
+        # scaling and grad-sync are owned by the accelerator: backward and
+        # clipping route through it and the model's own AMP scaler is bypassed.
+        accelerator = getattr(self, "accelerator", None)
+
         with self._autocast_context():
             self.netG_forward()
             G_loss = self.compute_G_loss()
 
-        if self.use_amp:
+        if accelerator is not None:
+            accelerator.backward(G_loss)
+        elif self.use_amp:
             self.scaler.scale(G_loss).backward()
         else:
             G_loss.backward()
@@ -280,13 +287,18 @@ class ModelPlain(ModelBase):
         # `clip_grad_norm` helps prevent the exploding gradient problem.
         G_optimizer_clipgrad = self.opt_train["G_optimizer_clipgrad"] if self.opt_train["G_optimizer_clipgrad"] else 0
         if G_optimizer_clipgrad > 0:
-            if self.use_amp:
-                self.scaler.unscale_(self.G_optimizer)
-            torch.nn.utils.clip_grad_norm_(
-                self.netG.parameters(), max_norm=self.opt_train["G_optimizer_clipgrad"], norm_type=2
-            )
+            if accelerator is not None:
+                accelerator.clip_grad_norm_(self.netG.parameters(), max_norm=G_optimizer_clipgrad)
+            else:
+                if self.use_amp:
+                    self.scaler.unscale_(self.G_optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.netG.parameters(), max_norm=self.opt_train["G_optimizer_clipgrad"], norm_type=2
+                )
 
-        if self.use_amp:
+        if accelerator is not None:
+            self.G_optimizer.step()
+        elif self.use_amp:
             self.scaler.step(self.G_optimizer)
             self.scaler.update()
         else:

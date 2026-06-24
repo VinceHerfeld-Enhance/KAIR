@@ -14,6 +14,10 @@ class ModelBase:
         print("Device: {}".format(self.device))
         self.is_train = opt["is_train"]  # training or not
         self.schedulers = []  # schedulers
+        # HuggingFace Accelerate handle. Left None for single-GPU / native-DDP
+        # training; the accelerate launcher sets it on the model so the backward
+        # pass, grad clipping and checkpoint unwrapping route through it.
+        self.accelerator = None
 
     """
     # ----------------------------------------
