@@ -329,6 +329,7 @@ def define_G(opt):
             use_anti_ghost=opt_net.get("use_anti_ghost", True),
             bspline_windowed=opt_net.get("bspline_windowed", True),
             bspline_confidence_splat=opt_net.get("bspline_confidence_splat", True)
+        )
     else:
         raise NotImplementedError("netG [{:s}] is not found.".format(net_type))
 
