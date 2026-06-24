@@ -1,3 +1,0 @@
-slurmstepd: error: execve(): idr_accelerate: No such file or directory
-srun: error: jzxh347: task 0: Exited with exit code 2
-srun: Terminating StepId=862183.0
