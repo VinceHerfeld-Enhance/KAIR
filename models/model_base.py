@@ -124,7 +124,11 @@ class ModelBase:
                 print('Using static graph. Make sure that "unused parameters" will not change during training loop.')
                 network._set_static_graph()
 
-        elif torch.cuda.device_count() > 1:
+        elif self.opt.get("use_dp", False) and torch.cuda.device_count() > 1:
+            # Only wrap in DataParallel when explicitly requested. Under Accelerate
+            # (opt["dist"] is False but accelerator.prepare wraps netG in DDP), an
+            # implicit DataParallel here would double-wrap and scatter params to
+            # cuda:0, breaking multi-process runs (params land on cuda:<local_rank>).
             network = DataParallel(network)
 
         return network
