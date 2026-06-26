@@ -327,8 +327,12 @@ def define_G(opt):
             interp_flow_mode=opt_net.get("interp_flow_mode", "quadratic"),
             unified_prior_adapter=opt_net.get("unified_prior_adapter", True),
             use_anti_ghost=opt_net.get("use_anti_ghost", True),
+            ag_photometric_cue=opt_net.get("ag_photometric_cue", False),
+            ag_source_select=opt_net.get("ag_source_select", False),
             bspline_windowed=opt_net.get("bspline_windowed", True),
-            bspline_confidence_splat=opt_net.get("bspline_confidence_splat", True)
+            bspline_confidence_splat=opt_net.get("bspline_confidence_splat", True),
+            bspline_window_coupling=opt_net.get("bspline_window_coupling", False),
+            bspline_coupling_hidden=opt_net.get("bspline_coupling_hidden", 64),
         )
     else:
         raise NotImplementedError("netG [{:s}] is not found.".format(net_type))
