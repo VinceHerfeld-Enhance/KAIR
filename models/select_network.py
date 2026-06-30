@@ -302,6 +302,7 @@ def define_G(opt):
             encoder_kwargs=opt_net.get("encoder_kwargs", None),
             is_low_res_input=opt_net.get("is_low_res_input", True),
             prior_nc=opt_net.get("prior_nc", None),
+            prior_nb=opt_net.get("prior_nb", 2),
             prior_type=opt_net.get("prior_type", "resunet"),
             prior_mamba_depth=opt_net.get("prior_mamba_depth", 6),
             prior_mamba_expansion=opt_net.get("prior_mamba_expansion", 2),
