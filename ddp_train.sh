@@ -13,6 +13,11 @@ cd ${SLURM_SUBMIT_DIR}
 module purge
 
 # load modules
+# The .venv below is layered on the pytorch-gpu module (system-site-packages),
+# so these MUST be loaded first — otherwise torch/MKL, basicsr, vsr and
+# idr_accelerate are all missing in the job. Mirrors the interactive setup.
+module load arch/h100
+module load pytorch-gpu/py3/2.8.0
 
 # Uncomment to load custom packages
 source /linkhome/rech/gennip01/ura93tx/storage/.venv/bin/activate
