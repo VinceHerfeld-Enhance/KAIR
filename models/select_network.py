@@ -319,6 +319,7 @@ def define_G(opt):
             sf=opt_net.get("sf", 4),
             tsf=opt_net.get("tsf", 2),
             ag_guidance_mode=opt_net.get("ag_guidance_mode", "occlusion"),
+            build_reference=opt_net.get("build_reference", False),
             refine_flows=opt_net.get("refine_flows", True),
             n_flows_per_frame=opt_net.get("n_flows_per_frame", 1),
             refine_features=opt_net.get("refine_features", False),
