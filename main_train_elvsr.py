@@ -545,7 +545,7 @@ def _run_validation(model, test_loader, opt, logger, epoch, current_step, tsf, s
         # -------------------------------
         # debug: save L / E / H frames for one test video
         # -------------------------------
-        if idx == 1 and opt["train"]["checkpoint_debug_frames"]:
+        if opt["val"]["checkpoint_debug_frames"]:
             debug_val_dir = os.path.join(opt["path"]["images"], "debug_val", f"iter_{current_step:08d}", folder[0])
             lr_frames = visuals["L"]  # [T_lq, C, H, W]
 
