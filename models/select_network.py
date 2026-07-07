@@ -332,6 +332,8 @@ def define_G(opt):
             ag_photometric_cue=opt_net.get("ag_photometric_cue", False),
             ag_source_select=opt_net.get("ag_source_select", False),
             window_motion_mode=opt_net.get("window_motion_mode", "compose"),
+            shared_onesided_mode=opt_net.get("shared_onesided_mode", "qvi"),
+            ag_shared_cues=opt_net.get("ag_shared_cues", True),
             bspline_confidence_splat=opt_net.get("bspline_confidence_splat", False),
             bspline_window_coupling=opt_net.get("bspline_window_coupling", False),
             bspline_coupling_hidden=opt_net.get("bspline_coupling_hidden", 64),
