@@ -333,6 +333,7 @@ def define_G(opt):
             ag_source_select=opt_net.get("ag_source_select", False),
             window_motion_mode=opt_net.get("window_motion_mode", "compose"),
             shared_stem=opt_net.get("shared_stem", "resunet"),
+            shared_flow_anchor=opt_net.get("shared_flow_anchor", True),
             ag_shared_cues=opt_net.get("ag_shared_cues", True),
             ag_accretion_deletion=opt_net.get("ag_accretion_deletion", False),
             bspline_confidence_splat=opt_net.get("bspline_confidence_splat", False),
