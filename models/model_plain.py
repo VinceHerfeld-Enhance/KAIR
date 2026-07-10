@@ -274,6 +274,15 @@ class ModelPlain(ModelBase):
             self.netG_forward()
             G_loss = self.compute_G_loss()
 
+        # Fail loud on a non-finite loss instead of letting NaN/inf flow through
+        # backward() and silently corrupt the weights (Adam moments never recover).
+        # This surfaces upstream numerical bugs at the step they first appear.
+        if not torch.isfinite(G_loss):
+            raise FloatingPointError(
+                f"Non-finite G_loss ({G_loss.item()}) at step {current_step}; "
+                "aborting before optimizer step corrupts the weights."
+            )
+
         if accelerator is not None:
             accelerator.backward(G_loss)
         elif self.use_amp:
