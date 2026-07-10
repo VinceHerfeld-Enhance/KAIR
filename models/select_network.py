@@ -333,11 +333,15 @@ def define_G(opt):
             ag_source_select=opt_net.get("ag_source_select", False),
             window_motion_mode=opt_net.get("window_motion_mode", "compose"),
             shared_onesided_mode=opt_net.get("shared_onesided_mode", "qvi"),
+            shared_gate_mode=opt_net.get("shared_gate_mode", "closed"),
+            shared_z_only_splat=opt_net.get("shared_z_only_splat", False),
             ag_shared_cues=opt_net.get("ag_shared_cues", True),
             ag_accretion_deletion=opt_net.get("ag_accretion_deletion", False),
             bspline_confidence_splat=opt_net.get("bspline_confidence_splat", False),
             bspline_window_coupling=opt_net.get("bspline_window_coupling", False),
             bspline_coupling_hidden=opt_net.get("bspline_coupling_hidden", 64),
+            fill_holes=opt_net.get("fill_holes", True),
+            coverage_to_prior=opt_net.get("coverage_to_prior", False),
         )
     else:
         raise NotImplementedError("netG [{:s}] is not found.".format(net_type))
