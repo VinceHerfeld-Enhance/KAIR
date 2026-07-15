@@ -48,6 +48,22 @@ class ModelELVSR(ModelPlain):
         if self.lambda_vjepa > 0:
             self._init_vjepa()
 
+        # ---- Edge-aware spatial smoothness on the predicted intermediate flow ----
+        # Targets "flying pixels": incoherent per-pixel flow that forward-splats
+        # content to scattered wrong locations. An image-edge-weighted first/second
+        # order smoothness prior suppresses flow gradients WITHIN objects (flat image
+        # regions) while RELAXING at object boundaries (image edges) — so it removes
+        # scatter without forcing exact object mapping (a soft, edge-respecting prior,
+        # not a hard segmentation constraint). Applied per hypothesis, so the K
+        # multi-hypothesis trajectories stay diverse (each is internally coherent;
+        # they may differ from one another). Set ``lambda_flow_smooth`` low and, if it
+        # over-smooths, decay it like the flow supervision. ``flow_smooth_order`` 1 or
+        # 2 (2 permits smooth gradients like rotation/zoom, penalizing only kinks);
+        # ``flow_smooth_edge`` is the edge sensitivity alpha in exp(-alpha*|grad I|).
+        self.lambda_flow_smooth = float(self.opt_train.get("lambda_flow_smooth", 0.0))
+        self.flow_smooth_order = int(self.opt_train.get("flow_smooth_order", 1))
+        self.flow_smooth_edge = float(self.opt_train.get("flow_smooth_edge", 10.0))
+
     # ----------------------------------------
     # feed L/H data, capturing sparse GT indices when present
     # ----------------------------------------
@@ -110,6 +126,12 @@ class ModelELVSR(ModelPlain):
         if vjepa_loss is not None:
             self.log_dict["vjepa_loss"] = self._detach_log_value(vjepa_loss)
             G_loss = G_loss + vjepa_loss
+
+        # ---- Edge-aware spatial flow smoothness (anti flying-pixel) ----
+        smooth_loss = self._compute_flow_smoothness_loss()
+        if smooth_loss is not None:
+            self.log_dict["flow_smooth_loss"] = self._detach_log_value(smooth_loss)
+            G_loss = G_loss + smooth_loss
 
         return G_loss
 
@@ -446,6 +468,84 @@ class ModelELVSR(ModelPlain):
         if n_terms == 0:
             return None
         return lam * total / n_terms
+
+    @staticmethod
+    def _edge_aware_flow_smoothness(flow, img, order=1, edge=10.0):
+        """Edge-aware first/second-order spatial smoothness of a flow field.
+
+        Args:
+            flow: ``[B, K, H, W, 2]`` multi-hypothesis flow, or ``[B, H, W, 2]``.
+            img:  ``[B, C, H, W]`` source-grid image; its gradients relax the
+                  penalty at object boundaries (edge-aware weighting).
+            order: 1 (penalize flow gradient) or 2 (penalize curvature — permits
+                   smoothly-varying flow like rotation/zoom, penalizes only kinks).
+            edge:  sensitivity alpha in ``exp(-alpha * |grad img|)``.
+
+        The K axis is folded into the batch, so smoothness is enforced
+        INDEPENDENTLY per hypothesis — each trajectory is made internally coherent
+        while the hypotheses stay free to differ from one another.
+        """
+        if flow.dim() == 4:
+            flow = flow.unsqueeze(1)
+        B, K, H, W, _ = flow.shape
+        f = flow.permute(0, 1, 4, 2, 3).reshape(B * K, 2, H, W)  # [BK, 2, H, W]
+        if img.shape[-2:] != (H, W):
+            img = F.interpolate(img, size=(H, W), mode="bilinear", align_corners=False)
+        img = img.unsqueeze(1).expand(B, K, -1, -1, -1).reshape(B * K, img.shape[1], H, W)
+
+        def dx(t):
+            return t[:, :, :, 1:] - t[:, :, :, :-1]
+
+        def dy(t):
+            return t[:, :, 1:, :] - t[:, :, :-1, :]
+
+        wx = torch.exp(-edge * dx(img).abs().mean(1, keepdim=True))
+        wy = torch.exp(-edge * dy(img).abs().mean(1, keepdim=True))
+        fx, fy = dx(f), dy(f)
+        if order >= 2:
+            fx, wx = dx(fx), wx[:, :, :, 1:]
+            fy, wy = dy(fy), wy[:, :, 1:, :]
+        loss_x = (fx.abs().mean(1, keepdim=True) * wx).mean()
+        loss_y = (fy.abs().mean(1, keepdim=True) * wy).mean()
+        return loss_x + loss_y
+
+    def _compute_flow_smoothness_loss(self):
+        """Edge-aware spatial smoothness on the network's predicted interp flows.
+
+        Independent of the RAFT teacher — uses only the exposed interp flows and
+        the input LR frames — so it applies even when flow supervision is off or
+        has decayed. Directly penalizes flying pixels (incoherent per-pixel flow),
+        with an image-edge weight that permits genuine motion discontinuities at
+        object boundaries. Bracket-anchored ``l2v``/``r2v`` are on the source (LR
+        bracket) grids, so their edge weights are exact; legacy virtual-anchored
+        ``v2l``/``v2r`` are weighted by the nearer bracket as a proxy (no image
+        exists at the virtual time).
+        """
+        if self.lambda_flow_smooth <= 0:
+            return None
+        net = self.get_bare_model(self.netG)
+        if not hasattr(net, "_aux_interp_flows") or not net._aux_interp_flows:
+            return None
+        t_in = self.L.shape[1]
+        order, edge = self.flow_smooth_order, self.flow_smooth_edge
+        total = self.L.new_tensor(0.0)
+        n_terms = 0
+        for gap_idx, gap_flows in enumerate(net._aux_interp_flows):
+            if gap_idx + 1 >= t_in:
+                continue
+            img_l, img_r = self.L[:, gap_idx], self.L[:, gap_idx + 1]
+            for flow_dict in gap_flows:
+                if "l2v" in flow_dict and "r2v" in flow_dict:
+                    total = total + self._edge_aware_flow_smoothness(flow_dict["l2v"], img_l, order, edge)
+                    total = total + self._edge_aware_flow_smoothness(flow_dict["r2v"], img_r, order, edge)
+                    n_terms += 2
+                elif "v2l" in flow_dict and "v2r" in flow_dict:
+                    total = total + self._edge_aware_flow_smoothness(flow_dict["v2l"], img_l, order, edge)
+                    total = total + self._edge_aware_flow_smoothness(flow_dict["v2r"], img_r, order, edge)
+                    n_terms += 2
+        if n_terms == 0:
+            return None
+        return self.lambda_flow_smooth * total / n_terms
 
     # ----------------------------------------
     # PSNR logging, aligned with sparse GT when present
