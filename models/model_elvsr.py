@@ -64,6 +64,14 @@ class ModelELVSR(ModelPlain):
         self.flow_smooth_order = int(self.opt_train.get("flow_smooth_order", 1))
         self.flow_smooth_edge = float(self.opt_train.get("flow_smooth_edge", 10.0))
 
+        # ---- Shared-trajectory co-visibility consistency (shared_bspline) ----
+        # Penalizes L-forward vs R-backward disagreement where the two brackets see the
+        # same surface (occ-gated), so co-visible content rides one trajectory instead
+        # of ghosting as a translucent double. 0 disables (ablation: fuser alone vs
+        # fuser + this loss). The net's shared_flow_fuser already provides the follow
+        # candidate; this loss supervises "follow the more accurate bracket".
+        self.lambda_covis = float(self.opt_train.get("lambda_covis_consistency", 0.0))
+
     # ----------------------------------------
     # feed L/H data, capturing sparse GT indices when present
     # ----------------------------------------
@@ -98,6 +106,12 @@ class ModelELVSR(ModelPlain):
             kwargs["interp_steps"] = self.interp_steps
         if teacher is not None:
             kwargs["teacher_flows"] = teacher
+        # Toggle the net's shared-trajectory consistency collection (training only;
+        # netG_forward is the training forward path). No-op unless shared_bspline.
+        if self.lambda_covis > 0:
+            net = self.get_bare_model(self.netG)
+            if hasattr(net, "collect_covis_loss"):
+                net.collect_covis_loss = True
         self.E = self.netG(self.L, **kwargs)
 
     # ----------------------------------------
@@ -132,6 +146,15 @@ class ModelELVSR(ModelPlain):
         if smooth_loss is not None:
             self.log_dict["flow_smooth_loss"] = self._detach_log_value(smooth_loss)
             G_loss = G_loss + smooth_loss
+
+        # ---- Shared-trajectory co-visibility consistency (shared_bspline) ----
+        if self.lambda_covis > 0:
+            net = self.get_bare_model(self.netG)
+            covis = net.covis_consistency_loss() if hasattr(net, "covis_consistency_loss") else None
+            if covis is not None:
+                covis = self.lambda_covis * covis
+                self.log_dict["covis_loss"] = self._detach_log_value(covis)
+                G_loss = G_loss + covis
 
         return G_loss
 
