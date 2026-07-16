@@ -25,6 +25,9 @@ def define_Model(opt):
 
     elif model == "elvsr":  # one input: L
         from models.model_elvsr import ModelELVSR as M
+
+    elif model == "bfstvsr":  # BF-STVSR from scratch: L (+ HR GT for the RAFT teacher)
+        from models.model_bfstvsr import ModelBFSTVSR as M
     else:
         raise NotImplementedError("Model [{:s}] is not defined.".format(model))
 

@@ -347,6 +347,22 @@ def define_G(opt):
             fill_holes=opt_net.get("fill_holes", True),
             coverage_to_prior=opt_net.get("coverage_to_prior", False),
         )
+    elif net_type == "bfstvsr":
+        # BF-STVSR (CVPR 2025) trained from scratch inside KAIR. Built via the VSR
+        # external wrapper, which imports the vendored repo in-process (needs the
+        # DCNv2 CUDA extension + cupy softsplat). We RETURN EARLY to skip
+        # init_weights below: LunaTokis uses SIREN-specific init and a seeded,
+        # frozen RAFT teacher that generic re-init would destroy.
+        from vsr.research_models.external.bfstvsr import load_bfstvsr_trainable
+
+        return load_bfstvsr_trainable(
+            sf=opt_net.get("sf", 4),
+            tsf=opt_net.get("tsf", 8),
+            flow_iters=opt_net.get("flow_iters", 12),
+            t_chunk=opt_net.get("t_chunk", 0),
+            checkpoint_path=opt_net.get("raft_seed_checkpoint", None),
+            bfstvsr_root=opt_net.get("bfstvsr_root", None),
+        )
     else:
         raise NotImplementedError("netG [{:s}] is not found.".format(net_type))
 
