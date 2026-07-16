@@ -337,6 +337,7 @@ def define_G(opt):
             shared_stem_nb=opt_net.get("shared_stem_nb", 1),
             shared_splat_scale_init=opt_net.get("shared_splat_scale_init", 8.0),
             shared_flow_anchor=opt_net.get("shared_flow_anchor", True),
+            shared_vis_splat_evidence=opt_net.get("shared_vis_splat_evidence", False),
             ag_shared_cues=opt_net.get("ag_shared_cues", True),
             ag_accretion_deletion=opt_net.get("ag_accretion_deletion", False),
             bspline_features=opt_net.get("bspline_features", 64),
