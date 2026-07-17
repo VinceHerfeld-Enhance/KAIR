@@ -458,6 +458,58 @@ class LmdbBackend(BaseStorageBackend):
             value_buf = txn.get(filepath.encode("ascii"))
         return value_buf
 
+    def get_shape(self, filepath, client_key):
+        """Read only the 16-byte raw-uint8 header and return ``(h, w, c)``.
+
+        Used to choose a crop box before reading pixels. Touches a single page
+        (the header) instead of the whole frame value. The value must have been
+        written by ``create_lmdb_raw.py`` (magic ``RAW_LMDB_MAGIC``).
+        """
+        filepath = str(filepath)
+        assert client_key in self._client, f"client_key {client_key} is not " "in lmdb clients."
+        client = self._client[client_key]
+        with client.begin(write=False, buffers=True) as txn:
+            buf = txn.get(filepath.encode("ascii"))
+            if buf is None:
+                raise KeyError(f"lmdb key not found: {filepath}")
+            if bytes(buf[:4]) != RAW_LMDB_MAGIC:
+                raise ValueError(f"lmdb value for {filepath} is not a raw-uint8 frame (bad magic).")
+            h, w, c = np.frombuffer(buf, dtype="<u4", count=3, offset=4)
+        return int(h), int(w), int(c)
+
+    def get_raw_crop(self, filepath, client_key, top, left, crop_h, crop_w):
+        """Read a spatial crop directly from a raw-uint8 frame value.
+
+        Only the crop's full-width row band (rows ``[top, top+crop_h)``) is
+        faulted in from the memory map; the rest of the frame is never touched.
+        The column slice is applied in-memory. Returns an HWC uint8 BGR array.
+
+        The crop is copied out *inside* the transaction, because the ``buffers``
+        memoryview is only valid while the txn is open.
+        """
+        filepath = str(filepath)
+        assert client_key in self._client, f"client_key {client_key} is not " "in lmdb clients."
+        client = self._client[client_key]
+        with client.begin(write=False, buffers=True) as txn:
+            buf = txn.get(filepath.encode("ascii"))
+            if buf is None:
+                raise KeyError(f"lmdb key not found: {filepath}")
+            if bytes(buf[:4]) != RAW_LMDB_MAGIC:
+                raise ValueError(f"lmdb value for {filepath} is not a raw-uint8 frame (bad magic).")
+            h, w, c = np.frombuffer(buf, dtype="<u4", count=3, offset=4)
+            h, w, c = int(h), int(w), int(c)
+            if top < 0 or left < 0 or top + crop_h > h or left + crop_w > w:
+                raise ValueError(
+                    f"crop (top={top}, left={left}, h={crop_h}, w={crop_w}) out of bounds "
+                    f"for frame ({h}, {w}) key={filepath}"
+                )
+            row_bytes = w * c
+            start = 16 + top * row_bytes
+            end = 16 + (top + crop_h) * row_bytes
+            band = np.frombuffer(buf[start:end], dtype=np.uint8).reshape(crop_h, w, c)
+            crop = np.ascontiguousarray(band[:, left : left + crop_w, :])
+        return crop
+
     def get_text(self, filepath):
         raise NotImplementedError
 
@@ -497,8 +549,26 @@ class FileClient(object):
         else:
             return self.client.get(filepath)
 
+    def get_shape(self, filepath, client_key="default"):
+        """Return ``(h, w, c)`` of a raw-uint8 frame (lmdb backend only)."""
+        if self.backend != "lmdb":
+            raise NotImplementedError("get_shape is only supported for the lmdb backend.")
+        return self.client.get_shape(filepath, client_key)
+
+    def get_raw_crop(self, filepath, top, left, crop_h, crop_w, client_key="default"):
+        """Return an HWC uint8 BGR crop of a raw-uint8 frame (lmdb backend only)."""
+        if self.backend != "lmdb":
+            raise NotImplementedError("get_raw_crop is only supported for the lmdb backend.")
+        return self.client.get_raw_crop(filepath, client_key, top, left, crop_h, crop_w)
+
     def get_text(self, filepath):
         return self.client.get_text(filepath)
+
+
+# Magic prefix for raw-uint8 LMDB values written by create_lmdb_raw.py. The value
+# layout is: [4B magic][12B: h,w,c as 3x little-endian uint32][h*w*c bytes HWC BGR].
+# A PNG/JPEG never starts with this, so it safely discriminates raw vs encoded values.
+RAW_LMDB_MAGIC = b"RAW1"
 
 
 def imfrombytes(content, flag="color", float32=False):
@@ -514,6 +584,14 @@ def imfrombytes(content, flag="color", float32=False):
     Returns:
         ndarray: Loaded image array.
     """
+    # Fast path: raw-uint8 frame (no decode). ``flag`` is ignored — frames are
+    # stored as 3-channel BGR, matching the default ``flag="color"`` output.
+    if len(content) >= 16 and bytes(content[:4]) == RAW_LMDB_MAGIC:
+        h, w, c = np.frombuffer(content, dtype="<u4", count=3, offset=4)
+        img = np.frombuffer(content, dtype=np.uint8, offset=16).reshape(int(h), int(w), int(c))
+        if float32:
+            return img.astype(np.float32) / 255.0
+        return img.copy()
     img_np = np.frombuffer(content, np.uint8)
     imread_flags = {"color": cv2.IMREAD_COLOR, "grayscale": cv2.IMREAD_GRAYSCALE, "unchanged": cv2.IMREAD_UNCHANGED}
     img = cv2.imdecode(img_np, imread_flags[flag])

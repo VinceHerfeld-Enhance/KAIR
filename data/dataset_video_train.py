@@ -72,6 +72,15 @@ class VideoRecurrentTrainDataset(data.Dataset):
         self.lq_frame_offset = opt.get("lq_frame_offset", 0)
         self.crop_min_variance = opt.get("crop_min_variance", 0.0)
         self.crop_max_retries = opt.get("crop_max_retries", 5)
+        # raw_lmdb: frames are stored as raw uint8 (create_lmdb_raw.py). Enables
+        # crop-before-decode: choose the crop box first, then read only the crop's
+        # row-band from each frame value (no PNG decode, less I/O). See
+        # utils_video.LmdbBackend.get_raw_crop.
+        self.raw_lmdb = bool(opt.get("raw_lmdb", False))
+        # Per-clip cache of LQ (h, w) for the crop-before-read path. Keyed by clip
+        # so datasets whose clips differ in resolution (e.g. Adobe240) are handled
+        # correctly; a single clip is always internally uniform.
+        self._lq_hw_cache = {}
         self.num_frame = opt["num_frame"]
         self.tsf = int(opt.get("tsf", 1))  # temporal scale factor: only load every tsf-th LQ frame
         # Per-sample temporal-interpolation supervision: each sample independently
@@ -148,6 +157,9 @@ class VideoRecurrentTrainDataset(data.Dataset):
                 self.io_backend_opt["db_paths"] = [self.lq_root, self.gt_root]
                 self.io_backend_opt["client_keys"] = ["lq", "gt"]
 
+        if self.raw_lmdb and not self.is_lmdb:
+            raise ValueError("raw_lmdb=True requires io_backend.type == 'lmdb'.")
+
         # temporal augmentation configs
         self.interval_list = opt.get("interval_list", [1])
         self.random_reverse = opt.get("random_reverse", False)
@@ -221,45 +233,89 @@ class VideoRecurrentTrainDataset(data.Dataset):
             else:
                 lq_indices = set(range(len(neighbor_list)))
 
-        # get the neighboring LQ and GT frames
         img_lqs = []
         img_gts = []
-        img_gt_path = None
-        for t, neighbor in enumerate(neighbor_list):
-            lq_frame = neighbor + self.lq_frame_offset
-            lq_name = f"{self.filename_prefix_lq}{lq_frame:{self.filename_tmpl_lq}}"
-            gt_name = f"{self.filename_prefix_gt}{neighbor:{self.filename_tmpl_gt}}"
+        lq_patch = self.gt_size // self.scale
 
-            # get LQ only for temporally subsampled indices
-            if t in lq_indices:
-                if self.is_lmdb:
-                    img_lq_path = f"{clip_name}/{lq_name}"
-                else:
-                    img_lq_path = self.lq_root / clip_name / f"{lq_name}.{self.filename_ext}"
-                img_bytes = self.file_client.get(img_lq_path, "lq")
-                img_lq = utils_video.imfrombytes(img_bytes, float32=True)
-                img_lqs.append(img_lq)
+        if self.raw_lmdb:
+            # ---- crop-before-decode path (raw-uint8 lmdb) ----
+            # Resolve LQ frame size once (assumes a uniform frame size across the
+            # set, which holds for REDS). Only the 16-byte header is read.
+            first_lq_frame = neighbor_list[0] + self.lq_frame_offset
+            first_lq_key = f"{clip_name}/{self.filename_prefix_lq}{first_lq_frame:{self.filename_tmpl_lq}}"
+            h_lq, w_lq = self._lq_hw_cache.get(clip_name, (None, None))
+            if h_lq is None:
+                h_lq, w_lq = self.file_client.get_shape(first_lq_key, "lq")[:2]
+                self._lq_hw_cache[clip_name] = (h_lq, w_lq)
+            if h_lq < lq_patch or w_lq < lq_patch:
+                raise ValueError(f"LQ ({h_lq},{w_lq}) is smaller than patch size {lq_patch} for clip {clip_name}.")
 
-            # get GT only for selected indices
-            if t in gt_indices:
-                if self.is_lmdb:
-                    img_gt_path = f"{clip_name}/{gt_name}"
-                else:
-                    img_gt_path = self.gt_root / clip_name / f"{gt_name}.{self.filename_ext}"
-                img_bytes = self.file_client.get(img_gt_path, "gt")
-                img_gt = utils_video.imfrombytes(img_bytes, float32=True)
-                img_gts.append(img_gt)
+            # Choose the crop box up front, re-rolling low-variance crops — mirrors
+            # utils_video.paired_random_crop (variance measured on the first LQ
+            # frame's candidate crop, itself read via crop-before-decode).
+            n_tries = self.crop_max_retries if self.crop_min_variance > 0 else 0
+            for _ in range(n_tries + 1):
+                top = random.randint(0, h_lq - lq_patch)
+                left = random.randint(0, w_lq - lq_patch)
+                if self.crop_min_variance <= 0:
+                    break
+                cand = self.file_client.get_raw_crop(first_lq_key, top, left, lq_patch, lq_patch, "lq")
+                if (cand.astype(np.float32) / 255.0).var() >= self.crop_min_variance:
+                    break
+            top_gt, left_gt = top * self.scale, left * self.scale
 
-        # randomly crop
-        img_gts, img_lqs = utils_video.paired_random_crop(
-            img_gts,
-            img_lqs,
-            self.gt_size,
-            self.scale,
-            img_gt_path,
-            min_variance=self.crop_min_variance,
-            max_retries=self.crop_max_retries,
-        )
+            for t, neighbor in enumerate(neighbor_list):
+                lq_frame = neighbor + self.lq_frame_offset
+                lq_name = f"{self.filename_prefix_lq}{lq_frame:{self.filename_tmpl_lq}}"
+                gt_name = f"{self.filename_prefix_gt}{neighbor:{self.filename_tmpl_gt}}"
+                if t in lq_indices:
+                    crop = self.file_client.get_raw_crop(
+                        f"{clip_name}/{lq_name}", top, left, lq_patch, lq_patch, "lq"
+                    )
+                    img_lqs.append(crop.astype(np.float32) / 255.0)
+                if t in gt_indices:
+                    crop = self.file_client.get_raw_crop(
+                        f"{clip_name}/{gt_name}", top_gt, left_gt, self.gt_size, self.gt_size, "gt"
+                    )
+                    img_gts.append(crop.astype(np.float32) / 255.0)
+        else:
+            # ---- decode-then-crop path (png lmdb / disk) ----
+            img_gt_path = None
+            for t, neighbor in enumerate(neighbor_list):
+                lq_frame = neighbor + self.lq_frame_offset
+                lq_name = f"{self.filename_prefix_lq}{lq_frame:{self.filename_tmpl_lq}}"
+                gt_name = f"{self.filename_prefix_gt}{neighbor:{self.filename_tmpl_gt}}"
+
+                # get LQ only for temporally subsampled indices
+                if t in lq_indices:
+                    if self.is_lmdb:
+                        img_lq_path = f"{clip_name}/{lq_name}"
+                    else:
+                        img_lq_path = self.lq_root / clip_name / f"{lq_name}.{self.filename_ext}"
+                    img_bytes = self.file_client.get(img_lq_path, "lq")
+                    img_lq = utils_video.imfrombytes(img_bytes, float32=True)
+                    img_lqs.append(img_lq)
+
+                # get GT only for selected indices
+                if t in gt_indices:
+                    if self.is_lmdb:
+                        img_gt_path = f"{clip_name}/{gt_name}"
+                    else:
+                        img_gt_path = self.gt_root / clip_name / f"{gt_name}.{self.filename_ext}"
+                    img_bytes = self.file_client.get(img_gt_path, "gt")
+                    img_gt = utils_video.imfrombytes(img_bytes, float32=True)
+                    img_gts.append(img_gt)
+
+            # randomly crop
+            img_gts, img_lqs = utils_video.paired_random_crop(
+                img_gts,
+                img_lqs,
+                self.gt_size,
+                self.scale,
+                img_gt_path,
+                min_variance=self.crop_min_variance,
+                max_retries=self.crop_max_retries,
+            )
 
         # augmentation - flip, rotate
         n_lq = len(img_lqs)
