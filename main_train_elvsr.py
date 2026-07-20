@@ -195,7 +195,14 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     # accelerator, so the model's internal AMP path is disabled below.
     # ----------------------------------------
     mixed_precision = _accelerate_mixed_precision(opt)
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=opt.get("find_unused_parameters", True))
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=opt.get("find_unused_parameters", True),
+        # Align DDP bucket views with the grad memory layout. cudnn.benchmark can
+        # emit 1x1-conv weight-grads in channels-last, mismatching the contiguous
+        # bucket and triggering a per-step reconcile copy (+ a "Grad strides do
+        # not match bucket view strides" warning). This removes both.
+        gradient_as_bucket_view=True,
+    )
     accelerator = Accelerator(mixed_precision=mixed_precision, kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
     is_main = accelerator.is_main_process
