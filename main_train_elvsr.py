@@ -202,6 +202,13 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
         # bucket and triggering a per-step reconcile copy (+ a "Grad strides do
         # not match bucket view strides" warning). This removes both.
         gradient_as_bucket_view=True,
+        # Wire through the option JSON's use_static_graph (previously read only by
+        # model_base.py's native DDP path, never by this Accelerate-based one, so it
+        # was a silent no-op here). Needed for modules whose parameters are reached by
+        # reentrant backward passes (e.g. splatting.backward_gridsample's internal
+        # torch.autograd.grad call), which otherwise trips DDP's "Expected to mark a
+        # variable ready only once" error.
+        static_graph=opt.get("use_static_graph", False),
     )
     accelerator = Accelerator(mixed_precision=mixed_precision, kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
