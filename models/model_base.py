@@ -64,11 +64,19 @@ class ModelBase:
         pass
 
     def update_learning_rate(self, n):
+        # ``n`` is the ABSOLUTE training step, and it must be passed through to
+        # the scheduler. Scheduler state (``last_epoch`` / ``T_cur`` / ``T_i``)
+        # is never checkpointed — only the optimizer is — so on resume the
+        # scheduler is rebuilt at step 0 with ``base_lrs`` taken from the
+        # ``initial_lr`` stored in the loaded optimizer state_dict. A relative
+        # ``scheduler.step()`` would therefore snap the LR back to the full base
+        # LR and restart the cosine from scratch on every restart. Stepping to
+        # the absolute ``n`` re-derives the correct LR in closed form instead.
         for scheduler in self.schedulers:
-            scheduler.step()
+            scheduler.step(n)
 
     def current_learning_rate(self):
-        return self.schedulers[0].get_lr()[0]
+        return self.schedulers[0].get_last_lr()[0]
 
     def requires_grad(self, model, flag=True):
         for p in model.parameters():
