@@ -351,6 +351,7 @@ def define_G(opt):
             bspline_window_coupling=opt_net.get("bspline_window_coupling", False),
             bspline_coupling_hidden=opt_net.get("bspline_coupling_hidden", 64),
             fill_holes=opt_net.get("fill_holes", True),
+            focus_blur=opt_net.get("focus_blur", True),
             coverage_to_prior=opt_net.get("coverage_to_prior", False),
             per_window_frame_z=opt_net.get("per_window_frame_z", False),
         )
