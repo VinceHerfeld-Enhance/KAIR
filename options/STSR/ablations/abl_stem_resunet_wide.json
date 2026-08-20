@@ -1,0 +1,253 @@
+{
+  "task": "abl_stem_resunet_wide",
+  "model": "elvsr",
+  "gpu_ids": [
+    0
+  ],
+  "dist": false,
+  "find_unused_parameters": false,
+  "use_static_graph": true,
+  "scale": 4,
+  "n_channels": 3,
+  "path": {
+    "root": "/home/vherfeld/storage/vherfeld/KAIR_experiments",
+    "pretrained_netG": null,
+    "pretrained_netE": null,
+    "pretrained_optimizerG": null
+  },
+  "datasets": {
+    "train": {
+      "name": "train_dataset",
+      "dataset_type": "VideoRecurrentTrainDataset",
+      "dataroot_gt": "/home/vherfeld/storage/vherfeld/datasets/Adobe240/Adobe240_train/train_hr_raw.lmdb",
+      "dataroot_lq": "/home/vherfeld/storage/vherfeld/datasets/Adobe240/Adobe240_train/train_lr_raw.lmdb",
+      "meta_info_file": "/home/vherfeld/storage/vherfeld/datasets/Adobe240/Adobe240_train/meta_info_Adobe240_train_GT.txt",
+      "filename_tmpl": "08d",
+      "filename_tmpl_lq": "05d",
+      "filename_tmpl_gt": "05d",
+      "filename_prefix_lq": "",
+      "filename_prefix_gt": "",
+      "lq_frame_offset": 0,
+      "filename_ext": "png",
+      "val_partition": "Adobe240_val",
+      "test_mode": false,
+      "io_backend": {
+        "type": "lmdb"
+      },
+      "raw_lmdb": true,
+      "num_frame": 105,
+      "tsf": 8,
+      "gt_size": 256,
+      "interval_list": [
+        1
+      ],
+      "random_reverse": false,
+      "use_hflip": true,
+      "use_rot": true,
+      "dataloader_shuffle": true,
+      "dataloader_num_workers": 16,
+      "dataloader_batch_size": 3,
+      "n_interp_samples": 1,
+      "crop_min_variance": 0.004,
+      "crop_max_retries": 5
+    },
+    "test": {
+      "name": "test_dataset",
+      "dataset_type": "VideoRecurrentTestDataset",
+      "dataroot_gt": "/home/vherfeld/storage/vherfeld/datasets/Adobe240/Adobe240_val/hr",
+      "dataroot_lq": "/home/vherfeld/storage/vherfeld/datasets/Adobe240/Adobe240_val/lr",
+      "test_list_dir": "/home/vherfeld/storage/vherfeld/datasets/Adobe240/Adobe240_val/val_list",
+      "cache_data": true,
+      "io_backend": {
+        "type": "disk"
+      },
+      "num_frame": -1
+    }
+  },
+  "netG": {
+    "net_type": "stvsr",
+    "mid_channels": 64,
+    "encoder_type": "rvrt",
+    "encoder_kwargs": {
+      "upscale": 4,
+      "clip_size": 2,
+      "flow_source": "raft",
+      "img_size": [
+        2,
+        64,
+        64
+      ],
+      "window_size": [
+        2,
+        8,
+        8
+      ],
+      "num_blocks": [
+        2,
+        4,
+        2
+      ],
+      "depths": [
+        2,
+        2,
+        2
+      ],
+      "embed_dims": [
+        90,
+        90,
+        90
+      ],
+      "num_heads": [
+        6,
+        6,
+        6
+      ],
+      "deformable_groups": 12,
+      "attention_heads": 12,
+      "spynet_path": "/home/vherfeld/storage/vherfeld/other_checkpoints/SpyNet/spynet.pth",
+      "cpu_cache_length": 100
+    },
+    "is_low_res_input": true,
+    "prior_type": "resunet",
+    "prior_nc": [
+      24,
+      48,
+      96,
+      160
+    ],
+    "sf": 4,
+    "tsf": 8,
+
+    "splat_window_size": 0,
+    "use_anti_ghost": false,
+    "fusion_softmax": false,
+    "ag_guidance_mode": "occlusion",
+    "build_reference": false,
+    "refine_flows": false,
+    "refine_features": false,
+    "residual_output": false,
+    "n_flows_per_frame": 1,
+    "unified_prior_adapter": true,
+    "focus_blur": false,
+    "fill_holes": true,
+    "coverage_to_prior": false,
+
+    "interp_flow_mode": "bspline",
+    "bspline_features": 64,
+    "bspline_order": 3,
+    "bspline_stem": "resunet",
+    "bspline_stem_nc": [
+      32,
+      32,
+      32,
+      32
+    ],
+    "bspline_stem_nb": 1,
+    "bspline_stem_out": 256,
+    "bspline_flow_anchor": true,
+    "bspline_flow_scale": 20.0,
+
+    "bspline_confidence_splat": true,
+    "decoupled_z_head": true,
+    "use_occ_cue": true,
+    "vis_splat_evidence": true,
+    "vis_head_n_freqs": 3,
+
+    "init_type": "default",
+    "init_bn_type": "uniform",
+    "init_gain": 1.0
+  },
+  "train": {
+    "teacher_flow_p0": 1.0,
+    "teacher_flow_decay_steps": 5000,
+    "lambda_flow_supervision": 0.1,
+    "flow_loss_decay_steps": 80000,
+    "flow_loss_min_weight": 0,
+    "n_interp_samples": 1,
+
+    "G_lossfn_type": "charbonnier",
+    "G_lossfn_weight": 1.0,
+    "G_charbonnier_eps": 1e-09,
+    "G_fft_loss_weight": 0.0,
+    "G_fft_loss_type": "l1",
+    "G_fft_mask_radius": 0,
+    "G_fft_mask_ratio": 0.1,
+    "E_decay": 0,
+
+    "G_optimizer_type": "adamw",
+    "G_optimizer_lr": 0.0001,
+    "G_optimizer_betas": [
+      0.9,
+      0.99
+    ],
+    "G_optimizer_wd": 0,
+    "G_optimizer_clipgrad": 0.5,
+    "G_optimizer_reuse": true,
+
+    "fix_iter": 900000,
+    "fix_lr_mul": 0.1,
+    "fix_keys": [
+      "optical_flow_model"
+    ],
+
+    "total_iter": 150000,
+    "G_scheduler_type": "CosineAnnealingRestartLR",
+    "G_scheduler_periods": [
+      150000
+    ],
+    "G_scheduler_restart_weights": [
+      1
+    ],
+    "G_scheduler_eta_min": 1e-07,
+
+    "G_regularizer_orthstep": null,
+    "G_regularizer_clipstep": null,
+    "G_param_strict": true,
+    "E_param_strict": true,
+    "checkpoint_test": 5000,
+    "checkpoint_save": 5000,
+    "checkpoint_print": 200,
+    "F_feature_layer": 34,
+    "F_weights": 1.0,
+    "F_lossfn_type": "l1",
+    "F_use_input_norm": true,
+    "F_use_range_norm": false,
+    "use_amp": false,
+    "runtime": {
+      "cudnn_benchmark": true,
+      "allow_tf32": true,
+      "matmul_precision": "high",
+      "dataloader": {
+        "pin_memory": true,
+        "persistent_workers": true,
+        "prefetch_factor": 4,
+        "val_num_workers": 4
+      }
+    },
+    "torch_compile": {
+      "enable": false,
+      "backend": "inductor",
+      "mode": "default",
+      "dynamic": false,
+      "fullgraph": false,
+      "cuda_only": true
+    }
+  },
+  "val": {
+    "checkpoint_debug_frames": 10000,
+    "save_img": false,
+    "pad_seq": false,
+    "flip_seq": false,
+    "center_frame_only": false,
+    "num_frame_testing": 0,
+    "num_frame_overlapping": 2,
+    "size_patch_testing": null,
+    "window_size": [
+      6,
+      8,
+      8
+    ]
+  },
+  "merge_bn": false,
+  "merge_bn_startpoint": -1
+}
