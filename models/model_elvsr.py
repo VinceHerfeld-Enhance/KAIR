@@ -76,7 +76,13 @@ class ModelELVSR(ModelPlain):
     # feed L/H data, capturing sparse GT indices when present
     # ----------------------------------------
     def feed_data(self, data, need_H=True):
-        super(ModelELVSR, self).feed_data(data, need_H)
+        if "lq_sel" in data:
+            # Arbitrary-spatial-scale batch: no LR on disk, synthesise it here.
+            self._feed_data_arbitrary_scale(data)
+        else:
+            super(ModelELVSR, self).feed_data(data, need_H)
+            self.out_size = None
+            self.scale_eff = None
         if "gt_indices" in data:
             self.gt_indices = data["gt_indices"].to(self.device, non_blocking=True)  # (B, K)
         else:
@@ -97,6 +103,62 @@ class ModelELVSR(ModelPlain):
         self.interp_steps = None
 
     # ----------------------------------------
+    # Arbitrary-spatial-scale batches: synthesise the LR from the GT crop
+    # ----------------------------------------
+    def _feed_data_arbitrary_scale(self, data):
+        """Build the LR input by downscaling the GT crop on the GPU.
+
+        The dataset hands over GT crops of side ``G = round(lq_patch * s)`` and no
+        LR at all (see ``VideoRecurrentTrainDataset``'s arbitrary-scale mode). The
+        LR is the GT at the input-aligned (anchor) times, downscaled to exactly
+        ``lq_patch``.
+
+        The resize is ``imresize_gpu``, the MATLAB-faithful antialiased bicubic —
+        the same operator MoTIF / BF-STVSR / VideoINR use for arbitrary-scale
+        training (``imresize_np(img, 1/s, True)``) and the field standard the
+        baselines were trained on. It is batched over the leading dims and caches
+        its resample matrices per ``(length, scale)``, so a per-step scale costs one
+        matrix build and then nothing.
+
+        Two details that are easy to get wrong and would corrupt training silently:
+
+        * The scale passed to the resize is ``lq_patch / G``, not ``1 / s``.
+          ``imresize_gpu`` returns ``ceil(in * scale)`` frames, so this lands on
+          ``ceil(G * lq_patch / G) == lq_patch`` exactly. Using ``1 / s`` would give
+          ``ceil(G / s)``, which is off by one for many ``s`` and would leave the
+          splat grid and the GT crop disagreeing by a scale-dependent amount.
+        * ``scale_eff`` is recomputed as ``G / lq_patch`` from the realised integer
+          sizes rather than reusing the sampled float (v3 does the same at
+          ``data.py:262``). Only this value maps the LR grid onto the GT crop, and
+          the network is given the absolute ``out_size`` anyway so no rounding of it
+          can reintroduce a mismatch.
+        """
+        from vsr.utils.matlab_functions import imresize_gpu
+
+        # H is mandatory here: it is the *source* of the LR, not just the target.
+        self.H = data["H"].to(self.device, non_blocking=True)  # [B, K, C, G, G]
+        # lq_sel / lq_patch are per-item but constant within a batch by construction
+        # (one scale per step), so entry 0 speaks for the batch.
+        lq_sel = data["lq_sel"][0].to(self.H.device)
+        lq_patch = int(data["lq_patch"][0])
+        g_h, g_w = self.H.shape[-2], self.H.shape[-1]
+
+        anchors = self.H.index_select(1, lq_sel)  # [B, T_in, C, G, G]
+        lr = imresize_gpu(anchors, lq_patch / g_h)
+        if self.opt_train.get("lr_quantize", True):
+            # Match the 8-bit round-trip a PNG-on-disk LR necessarily went through.
+            # Without this, a synthesised x4 LR is a *different* input distribution
+            # from the one the x4 checkpoint was trained on (un-clamped, un-quantised
+            # floats), which would silently degrade a warm start.
+            lr = (lr.clamp(0.0, 1.0) * 255.0).round() / 255.0
+        self.L = lr
+
+        # Absolute output geometry, so the network's output matches the GT crop
+        # exactly regardless of how the ratio rounds.
+        self.out_size = (int(g_h), int(g_w))
+        self.scale_eff = g_h / lq_patch
+
+    # ----------------------------------------
     # feed L to netG, with optional interp_steps and oracle teacher flows
     # ----------------------------------------
     def netG_forward(self):
@@ -112,6 +174,11 @@ class ModelELVSR(ModelPlain):
             net = self.get_bare_model(self.netG)
             if hasattr(net, "collect_covis_loss"):
                 net.collect_covis_loss = True
+        # Arbitrary-scale training passes the ABSOLUTE output resolution rather than
+        # a ratio, so the prediction lands on the GT crop exactly (BF-STVSR's
+        # ``scale=[[HH],[WW]]`` convention). None => the net uses its own self.sf.
+        if getattr(self, "out_size", None) is not None:
+            kwargs["out_size"] = self.out_size
         self.E = self.netG(self.L, **kwargs)
 
     # ----------------------------------------
@@ -128,6 +195,18 @@ class ModelELVSR(ModelPlain):
             G_loss = self.G_lossfn_weight * self.G_lossfn(E_sel, self.H)
         else:
             G_loss = self.G_lossfn_weight * self.G_lossfn(self.E, self.H)
+
+        # ---- Scale-invariant reweighting for arbitrary-scale training ----
+        # The pixel loss is a mean over the output, so its gradient magnitude scales
+        # with the output area; without this, large scales dominate every update and
+        # the small-scale end of the range is effectively untrained. Normalising by
+        # (4/s)^2 makes the contribution comparable to the x4 reference. Same factor
+        # as MoTIF / BF-STVSR (models/VideoSR_base_model.py:153).
+        if getattr(self, "scale_eff", None) is not None:
+            scale_weight = (4.0 / self.scale_eff) ** 2
+            G_loss = G_loss * scale_weight
+            self.log_dict["scale"] = self.scale_eff
+            self.log_dict["scale_weight"] = scale_weight
 
         # ---- Auxiliary flow supervision for intermediate flow corrector ----
         flow_loss = self._compute_flow_supervision_loss()

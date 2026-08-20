@@ -74,6 +74,29 @@ def _build_dataloader_kwargs(dataset_opt, runtime_opt=None, phase="train", world
         kwargs["prefetch_factor"] = int(loader_opt.get("prefetch_factor", default_prefetch))
         kwargs["worker_init_fn"] = _dataloader_worker_init
 
+    # Arbitrary-spatial-scale training: one scale per optimizer step, carried with
+    # the index so the worker knows it before it reads (see MultiScaleBatchSampler).
+    # batch_size/shuffle/drop_last move onto the sampler; the loader must not also
+    # set them or PyTorch raises.
+    if phase == "train" and dataset_opt.get("lq_patch") is not None:
+        from data.multi_scale_sampler import MultiScaleBatchSampler
+
+        scale_range = dataset_opt.get("scale_range", [1.2, 4.0])
+        kwargs["batch_sampler"] = MultiScaleBatchSampler(
+            num_samples=dataset_opt["_num_samples"],
+            batch_size=batch_size,
+            scale_range=(scale_range[0], scale_range[1]),
+            # One scale per optimizer step across ranks: Accelerate hands rank r the
+            # batches at positions r, r+W, ..., so grouping by W makes the W batches
+            # of one step share a scale.
+            group_size=world_size,
+            shuffle=shuffle,
+            drop_last=True,
+            seed=int(dataset_opt.get("scale_seed", 0)),
+        )
+        for key in ("batch_size", "shuffle", "drop_last"):
+            kwargs.pop(key, None)
+
     return kwargs
 
 
@@ -327,10 +350,21 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
             if is_main:
                 logger.info("Number of train images: {:,d}, iters: {:,d}".format(len(train_set), train_size))
             # Accelerate shards the prepared loader across processes.
+            # MultiScaleBatchSampler needs the dataset length up front.
+            dataset_opt["_num_samples"] = len(train_set)
             train_loader_kwargs = _build_dataloader_kwargs(
                 dataset_opt, runtime_opt, phase="train", world_size=world_size
             )
             train_loader = DataLoader(train_set, **train_loader_kwargs)
+            if is_main and "batch_sampler" in train_loader_kwargs:
+                sampler = train_loader_kwargs["batch_sampler"]
+                logger.info(
+                    f"  Arbitrary spatial scale: s ~ U({sampler.scale_lo}, {sampler.scale_hi}), "
+                    f"one scale per optimizer step (group_size={sampler.group_size}); "
+                    f"LR patch {dataset_opt['lq_patch']}, GT crop = round(lq_patch * s) "
+                    f"in [{round(dataset_opt['lq_patch'] * sampler.scale_lo)}, "
+                    f"{round(dataset_opt['lq_patch'] * sampler.scale_hi)}]"
+                )
 
         elif phase == "test":
             test_set = define_Dataset(dataset_opt)

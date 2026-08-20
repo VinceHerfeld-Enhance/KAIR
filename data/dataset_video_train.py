@@ -62,7 +62,11 @@ class VideoRecurrentTrainDataset(data.Dataset):
         self.opt = opt
         self.scale = opt.get("scale", 4)
         self.gt_size = opt.get("gt_size", 256)
-        self.gt_root, self.lq_root = Path(opt["dataroot_gt"]), Path(opt["dataroot_lq"])
+        self.gt_root = Path(opt["dataroot_gt"])
+        # dataroot_lq is optional: arbitrary-scale mode synthesises the LR from the
+        # GT crop and never opens an LQ database. Falling back to gt_root keeps the
+        # attribute defined for the code paths that still reference it.
+        self.lq_root = Path(opt["dataroot_lq"]) if opt.get("dataroot_lq") else self.gt_root
         self.filename_tmpl = opt.get("filename_tmpl", "08d")
         self.filename_tmpl_lq = opt.get("filename_tmpl_lq", self.filename_tmpl)
         self.filename_tmpl_gt = opt.get("filename_tmpl_gt", self.filename_tmpl)
@@ -81,6 +85,7 @@ class VideoRecurrentTrainDataset(data.Dataset):
         # so datasets whose clips differ in resolution (e.g. Adobe240) are handled
         # correctly; a single clip is always internally uniform.
         self._lq_hw_cache = {}
+        self._gt_hw_cache = {}
         self.num_frame = opt["num_frame"]
         self.tsf = int(opt.get("tsf", 1))  # temporal scale factor: only load every tsf-th LQ frame
         # Per-sample temporal-interpolation supervision: each sample independently
@@ -99,6 +104,38 @@ class VideoRecurrentTrainDataset(data.Dataset):
                 f"num_frame ({self.num_frame}) must satisfy (num_frame-1) % tsf == 0 "
                 f"for per-sample temporal interpolation (tsf={self.tsf})"
             )
+
+        # ---- Arbitrary-spatial-scale mode (``lq_patch`` set) ----
+        # The LR patch size is the CONFIGURED quantity and the GT crop is inferred
+        # per batch as ``round(lq_patch * s)``. That is the inverse of the legacy
+        # geometry (``lq_patch = gt_size // scale``), whose floor division breaks
+        # alignment at non-divisor scales: at gt_size=256, scale=3 it yields
+        # lq_patch=85 while ``top_gt = top * 3`` indexes a 255-wide box, so the LQ
+        # crop and the GT crop stop being the same content.
+        #
+        # No LQ is read from disk in this mode: the LR is synthesised from the GT
+        # crop (on GPU, in the model's ``feed_data``), which is what MoTIF /
+        # BF-STVSR / VideoINR / v3 all do for arbitrary-scale training. ``s``
+        # arrives per item from the batch sampler (see ``MultiScaleBatchSampler``)
+        # so the worker knows it BEFORE choosing a crop box — that is what keeps the
+        # raw-lmdb crop-before-decode path usable, and it makes the read volume
+        # shrink with the scale instead of always paying the s_max footprint.
+        self.lq_patch = opt.get("lq_patch", None)
+        self.multi_scale = self.lq_patch is not None
+        if self.multi_scale:
+            self.lq_patch = int(self.lq_patch)
+            # The LR input is built from the GT frames at the input-aligned (anchor)
+            # times, so every multiple of tsf must actually be among the decoded GT
+            # frames. ``per_sample_interp`` guarantees that by construction
+            # (``gt_pos`` starts from all ``g * tsf``); the ``sparse_gt_frames`` path
+            # does not, so refuse rather than silently build the LR from the wrong
+            # frames.
+            if not self.per_sample_interp:
+                raise ValueError(
+                    "lq_patch (arbitrary-scale mode) requires the per-sample temporal "
+                    "interpolation path, i.e. tsf > 1 and n_interp_samples set. Otherwise the "
+                    "input-aligned GT frames the LR is derived from are not guaranteed to be loaded."
+                )
 
         keys = []
         total_num_frames = []  # some clips may not have 100 frames
@@ -150,7 +187,13 @@ class VideoRecurrentTrainDataset(data.Dataset):
         self.is_lmdb = False
         if self.io_backend_opt["type"] == "lmdb":
             self.is_lmdb = True
-            if hasattr(self, "flow_root") and self.flow_root is not None:
+            if self.multi_scale:
+                # GT only: no LQ is ever read. Registering an "lq" client pointing at
+                # the same directory would make lmdb.open() fail outright ("already
+                # open in this process") when dataroot_lq is left equal to dataroot_gt.
+                self.io_backend_opt["db_paths"] = [self.gt_root]
+                self.io_backend_opt["client_keys"] = ["gt"]
+            elif hasattr(self, "flow_root") and self.flow_root is not None:
                 self.io_backend_opt["db_paths"] = [self.lq_root, self.gt_root, self.flow_root]
                 self.io_backend_opt["client_keys"] = ["lq", "gt", "flow"]
             else:
@@ -167,6 +210,18 @@ class VideoRecurrentTrainDataset(data.Dataset):
         print(f"Temporal augmentation interval list: [{interval_str}]; " f"random reverse is {self.random_reverse}.")
 
     def __getitem__(self, index):
+        # In arbitrary-scale mode the sampler hands over ``(index, scale)`` instead
+        # of a bare index, so the worker knows the scale before it reads anything.
+        scale = None
+        if isinstance(index, (tuple, list)):
+            index, scale = index[0], float(index[1])
+        if self.multi_scale and scale is None:
+            raise ValueError(
+                "lq_patch is set (arbitrary-scale mode) but this item arrived without a scale. "
+                "Build the DataLoader with MultiScaleBatchSampler so every item in a batch "
+                "shares one scale."
+            )
+
         if self.file_client is None:
             self.file_client = utils_video.FileClient(self.io_backend_opt.pop("type"), **self.io_backend_opt)
 
@@ -235,9 +290,59 @@ class VideoRecurrentTrainDataset(data.Dataset):
 
         img_lqs = []
         img_gts = []
-        lq_patch = self.gt_size // self.scale
+        gt_indices_set = set(gt_indices)
+        if self.multi_scale:
+            # LR size fixed by config; GT crop inferred from this batch's scale.
+            lq_patch = self.lq_patch
+            gt_size = round(lq_patch * scale)
+        else:
+            gt_size = self.gt_size
+            lq_patch = self.gt_size // self.scale
 
-        if self.raw_lmdb:
+        if self.multi_scale:
+            # ---- HR-only crop-before-decode path (arbitrary spatial scale) ----
+            # The crop box is chosen on the GT grid; there is only one grid now, so
+            # the legacy ``top_gt = top * scale`` remap (and its rounding hazard)
+            # is gone. No LQ key is touched at all.
+            if not self.raw_lmdb:
+                raise ValueError(
+                    "lq_patch (arbitrary-scale mode) currently requires raw_lmdb=True. "
+                    "The point of this mode is crop-before-decode on the GT grid; a "
+                    "decode-then-crop fallback would read whole frames and silently "
+                    "destroy the read-time advantage."
+                )
+            first_gt_frame = neighbor_list[0]
+            first_gt_key = f"{clip_name}/{self.filename_prefix_gt}{first_gt_frame:{self.filename_tmpl_gt}}"
+            h_gt, w_gt = self._gt_hw_cache.get(clip_name, (None, None))
+            if h_gt is None:
+                h_gt, w_gt = self.file_client.get_shape(first_gt_key, "gt")[:2]
+                self._gt_hw_cache[clip_name] = (h_gt, w_gt)
+            if h_gt < gt_size or w_gt < gt_size:
+                raise ValueError(
+                    f"GT ({h_gt},{w_gt}) is smaller than the crop {gt_size} needed for "
+                    f"lq_patch={lq_patch} at scale {scale:.4f} (clip {clip_name})."
+                )
+
+            n_tries = self.crop_max_retries if self.crop_min_variance > 0 else 0
+            for _ in range(n_tries + 1):
+                top = random.randint(0, h_gt - gt_size)
+                left = random.randint(0, w_gt - gt_size)
+                if self.crop_min_variance <= 0:
+                    break
+                cand = self.file_client.get_raw_crop(first_gt_key, top, left, gt_size, gt_size, "gt")
+                if (cand.astype(np.float32) / 255.0).var() >= self.crop_min_variance:
+                    break
+
+            for t, neighbor in enumerate(neighbor_list):
+                if t not in gt_indices_set:
+                    continue
+                gt_name = f"{self.filename_prefix_gt}{neighbor:{self.filename_tmpl_gt}}"
+                crop = self.file_client.get_raw_crop(
+                    f"{clip_name}/{gt_name}", top, left, gt_size, gt_size, "gt"
+                )
+                img_gts.append(crop.astype(np.float32) / 255.0)
+
+        elif self.raw_lmdb:
             # ---- crop-before-decode path (raw-uint8 lmdb) ----
             # Resolve LQ frame size once (assumes a uniform frame size across the
             # set, which holds for REDS). Only the 16-byte header is read.
@@ -325,12 +430,31 @@ class VideoRecurrentTrainDataset(data.Dataset):
 
         img_results = utils_video.img2tensor(img_results)
         img_gts = torch.stack(img_results[n_lq:], dim=0)
-        img_lqs = torch.stack(img_results[:n_lq], dim=0)
 
         # img_lqs: (t_lq, c, h, w)  — temporally subsampled if tsf > 1
         # img_gts: (k, c, h, w)  where k <= num_frame (sparse) or k == num_frame (full)
         # key: str
-        result = {"L": img_lqs, "H": img_gts, "key": key}
+        result = {"H": img_gts, "key": key}
+        if self.multi_scale:
+            # No LR on disk: the model synthesises it from the GT anchors (see
+            # ModelELVSR.feed_data). Augmentation has already been applied to the GT,
+            # and downscaling commutes with the flips/transpose ``augment`` uses on a
+            # square crop, so deriving the LR afterwards is equivalent to augmenting
+            # a precomputed LR.
+            #
+            # ``lq_sel`` are the positions WITHIN H of the input-aligned (anchor)
+            # frames, i.e. the frames the LR is built from. H holds a sparse subset of
+            # frame positions, so the anchors are not at a fixed stride inside it.
+            result["lq_sel"] = torch.tensor(
+                [j for j, p in enumerate(gt_indices) if p % self.tsf == 0], dtype=torch.long
+            )
+            # The realised scale, recomputed from the integer sizes rather than
+            # carried over from the sampled float (v3's data.py:262 discipline): this
+            # is the number that actually maps the LR grid onto the GT crop.
+            result["gt_size"] = torch.tensor(gt_size, dtype=torch.long)
+            result["lq_patch"] = torch.tensor(lq_patch, dtype=torch.long)
+        else:
+            result["L"] = torch.stack(img_results[:n_lq], dim=0)
         if self.per_sample_interp:
             # Per-sample sub-step indices, shape [n_gaps, n_interp_samples].
             # The model turns these into per-sample tau; H is already 1:1 with the
