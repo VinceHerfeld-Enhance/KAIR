@@ -340,7 +340,6 @@ def define_G(opt):
             use_occ_cue=opt_net.get("use_occ_cue", True),
             shared_spline_agree_cue=opt_net.get("shared_spline_agree_cue", True),
             vis_splat_evidence=opt_net.get("vis_splat_evidence", False),
-            shared_vis_splat_evidence=opt_net.get("shared_vis_splat_evidence", False),
             ag_shared_cues=opt_net.get("ag_shared_cues", True),
             ag_accretion_deletion=opt_net.get("ag_accretion_deletion", False),
             bspline_features=opt_net.get("bspline_features", 64),
