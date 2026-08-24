@@ -1,5 +1,5 @@
 {
-  "task": "abl_vis_no_evidence",
+  "task": "abl_mask_bfstvsr",
   "model": "elvsr",
   "gpu_ids": [
     0
@@ -148,7 +148,7 @@
     "bspline_flow_scale": 20.0,
 
     "bspline_confidence_splat": true,
-    "decoupled_z_head": true,
+    "decoupled_z_head": false,
     "use_occ_cue": true,
     "vis_splat_evidence": false,
     "vis_head_n_freqs": 3,

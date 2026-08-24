@@ -147,10 +147,10 @@
     "bspline_flow_anchor": true,
     "bspline_flow_scale": 20.0,
 
-    "bspline_confidence_splat": true,
-    "decoupled_z_head": true,
+    "bspline_confidence_splat": false,
+    "decoupled_z_head": false,
     "use_occ_cue": true,
-    "vis_splat_evidence": true,
+    "vis_splat_evidence": false,
     "vis_head_n_freqs": 3,
 
     "init_type": "default",
