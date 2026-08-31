@@ -299,18 +299,49 @@ class VideoRecurrentTrainDataset(data.Dataset):
             gt_size = self.gt_size
             lq_patch = self.gt_size // self.scale
 
-        if self.multi_scale:
-            # ---- HR-only crop-before-decode path (arbitrary spatial scale) ----
+        if self.multi_scale and not self.raw_lmdb:
+            # ---- HR-only decode-then-crop path (arbitrary spatial scale, no raw lmdb) ----
+            # Slower than the crop-before-decode path below (reads/decodes whole
+            # frames instead of just the crop bytes), but works against a plain
+            # PNG lmdb/disk tree -- no raw-uint8 lmdb has to exist. ``imfrombytes``
+            # already normalises to float32 [0,1] regardless of source format, so
+            # this produces pixel-identical crops to the raw path for the same
+            # (clip, frame, top, left, gt_size). No LQ key is touched either way.
+            decoded = {}
+            for t, neighbor in enumerate(neighbor_list):
+                if t not in gt_indices_set:
+                    continue
+                gt_name = f"{self.filename_prefix_gt}{neighbor:{self.filename_tmpl_gt}}"
+                img_gt_path = f"{clip_name}/{gt_name}" if self.is_lmdb else self.gt_root / clip_name / f"{gt_name}.{self.filename_ext}"
+                img_bytes = self.file_client.get(img_gt_path, "gt")
+                decoded[t] = utils_video.imfrombytes(img_bytes, float32=True)
+
+            first_t = next(iter(decoded))
+            h_gt, w_gt = decoded[first_t].shape[:2]
+            if h_gt < gt_size or w_gt < gt_size:
+                raise ValueError(
+                    f"GT ({h_gt},{w_gt}) is smaller than the crop {gt_size} needed for "
+                    f"lq_patch={lq_patch} at scale {scale:.4f} (clip {clip_name})."
+                )
+
+            n_tries = self.crop_max_retries if self.crop_min_variance > 0 else 0
+            for _ in range(n_tries + 1):
+                top = random.randint(0, h_gt - gt_size)
+                left = random.randint(0, w_gt - gt_size)
+                if self.crop_min_variance <= 0:
+                    break
+                cand = decoded[first_t][top : top + gt_size, left : left + gt_size]
+                if cand.var() >= self.crop_min_variance:
+                    break
+
+            for t in sorted(decoded):
+                img_gts.append(decoded[t][top : top + gt_size, left : left + gt_size])
+
+        elif self.multi_scale:
+            # ---- HR-only crop-before-decode path (arbitrary spatial scale, raw lmdb) ----
             # The crop box is chosen on the GT grid; there is only one grid now, so
             # the legacy ``top_gt = top * scale`` remap (and its rounding hazard)
             # is gone. No LQ key is touched at all.
-            if not self.raw_lmdb:
-                raise ValueError(
-                    "lq_patch (arbitrary-scale mode) currently requires raw_lmdb=True. "
-                    "The point of this mode is crop-before-decode on the GT grid; a "
-                    "decode-then-crop fallback would read whole frames and silently "
-                    "destroy the read-time advantage."
-                )
             first_gt_frame = neighbor_list[0]
             first_gt_key = f"{clip_name}/{self.filename_prefix_gt}{first_gt_frame:{self.filename_tmpl_gt}}"
             h_gt, w_gt = self._gt_hw_cache.get(clip_name, (None, None))

@@ -140,6 +140,35 @@ def raw_gt_lmdb(tmp_path_factory):
     return str(db), str(meta)
 
 
+@pytest.fixture(scope="module")
+def png_gt_lmdb(tmp_path_factory):
+    """A plain PNG-in-lmdb GT LMDB (create_lmdb.py's layout: raw PNG-encoded
+    bytes as the value, no raw-uint8 header) built from the SAME deterministic
+    frames as ``raw_gt_lmdb`` (same seed, same synthesis), so the two are
+    directly comparable pixel-for-pixel."""
+    lmdb = pytest.importorskip("lmdb")
+    cv2 = pytest.importorskip("cv2")
+
+    root = tmp_path_factory.mktemp("multiscale_png")
+    db = root / "gt_png.lmdb"
+    h, w, c, clip = 720, 1280, 3, "000"
+    rng = np.random.default_rng(0)  # same seed as raw_gt_lmdb -> identical frames
+
+    env = lmdb.open(str(db), map_size=int(4e9))
+    with env.begin(write=True) as txn:
+        for i in range(NUM_FRAME):
+            base = rng.integers(0, 256, (h // 8, w // 8, c), dtype=np.uint8)
+            img = np.ascontiguousarray(np.repeat(np.repeat(base, 8, 0), 8, 1))
+            ok, enc = cv2.imencode(".png", img)
+            assert ok
+            txn.put(f"{clip}/{i:08d}".encode("ascii"), enc.tobytes())
+    env.close()
+
+    meta = root / "meta_info_file.txt"
+    meta.write_text(f"{clip} {NUM_FRAME} ({h},{w},{c}) 0\n")
+    return str(db), str(meta)
+
+
 def _dataset(raw_gt_lmdb, **overrides):
     from data.dataset_video_train import VideoRecurrentTrainDataset
 
@@ -224,3 +253,45 @@ def test_lr_synthesis_closes_the_geometry(raw_gt_lmdb):
         assert torch.isfinite(lr).all()
         s_eff = g / LQ_PATCH
         assert round(LQ_PATCH * s_eff) == g
+
+
+# ---------------------------------------------------------------------------
+# Decode-then-crop fallback (multi_scale without a raw-uint8 LMDB)
+# ---------------------------------------------------------------------------
+
+
+def test_dataset_reads_no_lq_and_infers_the_gt_crop_without_raw_lmdb(png_gt_lmdb):
+    dataset = _dataset(png_gt_lmdb, raw_lmdb=False)
+    assert dataset.multi_scale
+    for step, scale in enumerate([1.2, 2.0, 2.5, 3.7, 4.0]):
+        item = dataset[(step % len(dataset), scale)]
+        expected = round(LQ_PATCH * scale)
+        assert "L" not in item, "arbitrary-scale mode must not read any LR from disk"
+        assert item["H"].shape[-2:] == (expected, expected)
+        assert int(item["gt_size"]) == expected
+        assert int(item["lq_patch"]) == LQ_PATCH
+
+
+def test_decode_then_crop_matches_raw_crop_pixelwise(raw_gt_lmdb, png_gt_lmdb, monkeypatch):
+    """The whole point of the fallback: for the same (clip, frame, top, left,
+    gt_size), decode-then-crop against a plain PNG lmdb must reproduce the
+    exact pixels the crop-before-decode path reads from a raw-uint8 lmdb --
+    PNG is lossless, so there is no excuse for these to differ."""
+    import random as random_module
+
+    # Fix top/left (via randint) AND reset the global RNG (via seed) before each
+    # access, so temporal-sample selection and flip/rotate augmentation -- which
+    # also draw from ``random`` -- proceed identically for both variants. That
+    # isolates the comparison to the one thing under test: raw-crop vs
+    # decode-then-crop pixel equality, not incidental augmentation drift.
+    def _fixed_item(dataset):
+        random_module.seed(42)
+        calls = iter([123, 45])
+        monkeypatch.setattr(random_module, "randint", lambda lo, hi: next(calls))
+        return dataset[(0, 2.7)]
+
+    item_raw = _fixed_item(_dataset(raw_gt_lmdb, raw_lmdb=True))
+    item_png = _fixed_item(_dataset(png_gt_lmdb, raw_lmdb=False))
+
+    assert item_raw["H"].shape == item_png["H"].shape
+    assert torch.equal(item_raw["H"], item_png["H"])
