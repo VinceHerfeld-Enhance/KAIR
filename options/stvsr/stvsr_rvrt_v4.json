@@ -1,0 +1,198 @@
+{
+  "task": "stvsr_rvrt_v4",
+  "model": "elvsr",
+  "gpu_ids": [
+    0 ,
+    1 ,
+    2 , 
+    3
+  ],
+  "dist": "True",
+  "find_unused_parameters": false,
+  "use_static_graph": true,
+  "scale": 4,
+  "n_channels": 3,
+  "path": {
+    "root": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments",
+    "pretrained_netG": null,
+    "pretrained_netE": null,
+    "task": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/stvsr_rvrt_v4",
+    "log": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/stvsr_rvrt_v4/log",
+    "options": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/stvsr_rvrt_v4/options",
+    "models": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/stvsr_rvrt_v4/models",
+    "images": "/linkhome/rech/gennip01/ura93tx/storage/KAIR_experiments/stvsr_rvrt_v4/images",
+    "pretrained_optimizerG": null
+  },
+  "datasets": {
+    "train": {
+      "name": "train_dataset",
+      "dataset_type": "VideoRecurrentTrainDataset",
+      "dataroot_gt": "/linkhome/rech/gennip01/ura93tx/storage/datasets/Adobe240/Adobe240_train/train_hr.lmdb",
+      "dataroot_lq": "/linkhome/rech/gennip01/ura93tx/storage/datasets/Adobe240/Adobe240_train/train_lr.lmdb",
+      "meta_info_file": "/linkhome/rech/gennip01/ura93tx/storage/datasets/Adobe240/Adobe240_train/meta_info_Adobe240_train_GT.txt",
+      "filename_tmpl_lq": "05d",
+      "filename_tmpl_gt": "05d",
+      "filename_prefix_lq": "",
+      "filename_prefix_gt": "",
+      "lq_frame_offset": 0,
+      "filename_ext": "png",
+      "val_partition": "Adobe_val",
+      "test_mode": false,
+      "io_backend": {
+        "type": "lmdb"
+      },
+      "num_frame": 105,
+      "gt_size": 256,
+      "interval_list": [
+        1
+      ],
+      "tsf":8,
+      "random_reverse": false,
+      "use_hflip": true,
+      "use_rot": true,
+      "dataloader_shuffle": true,
+      "dataloader_num_workers": 48,
+      "dataloader_batch_size": 4,
+      "phase": "train",
+      "scale": 4,
+      "n_channels": 3
+    },
+    "test": {
+      "name": "test_dataset",
+      "dataset_type": "VideoRecurrentTestDataset",
+      "dataroot_gt": "/linkhome/rech/gennip01/ura93tx/scratch/datasets/Adobe240/Adobe240_val/hr",
+      "dataroot_lq": "/linkhome/rech/gennip01/ura93tx/scratch/datasets/Adobe240/Adobe240_val/lr",
+      "test_list_dir": "/linkhome/rech/gennip01/ura93tx/scratch/datasets/Adobe240/Adobe240_val/val_list",
+      "cache_data": true,
+      "io_backend": {
+        "type": "disk"
+      },
+      "num_frame": -1,
+      "phase": "test",
+      "scale": 4,
+      "n_channels": 3
+    }
+  },
+  "netG": {
+  "net_type": "stvsr",
+  "mid_channels": 64,
+  "encoder_type": "rvrt",
+  "encoder_kwargs": 
+    {
+    "upscale": 4,
+    "clip_size": 2,
+    "img_size": [2, 64, 64],
+    "window_size": [2, 8, 8],
+    "num_blocks": [2, 4, 2],
+    "depths": [2, 2, 2],
+    "embed_dims": [90, 90, 90],
+    "num_heads": [6, 6, 6],
+    "deformable_groups": 12,
+    "attention_heads": 12,
+    "spynet_path": "/linkhome/rech/gennip01/ura93tx/storage/other_checkpoints/SpyNet/spynet_sintel_final-3d2a1287.pth",
+    "cpu_cache_length": 100
+    },
+  "is_low_res_input": true,
+  "prior_type": "resunet",
+  "prior_nc": [32, 64, 128, 256],
+  "sf": 4,
+  "tsf": 8,
+  "splat_window_size": 1,
+  "ag_guidance_mode": "occlusion",
+  "refine_flows": false,
+  "residual_output": false,
+  "fusion_softmax": false,
+  "use_anti_ghost": false,
+  "n_flows_per_frame": 1,
+  "refine_features": false,
+  "refine_guidance_mode": "occlusion",
+  "interp_flow_mode": "bspline",
+  "bspline_windowed": true,
+  "bspline_confidence_splat": true,
+  "unified_prior_adapter": true,
+  "init_type": "default",
+  "init_bn_type": "uniform",
+  "init_gain": 1.0
+  },
+  "train": {
+    "raft_checkpoint": "/linkhome/rech/gennip01/ura93tx/storage/other_checkpoints/RAFT/raft.pth",
+    "teacher_flow_p0": 1.0,
+    "teacher_flow_decay_steps": 5000,
+    "n_interp_samples": 1,
+    "G_lossfn_type": "charbonnier",
+    "G_lossfn_weight": 1.0,
+    "G_charbonnier_eps": 1e-09,
+    "lambda_flow_supervision": 0.01,
+    "flow_loss_min_weight": 0,
+    "flow_loss_decay_steps": 5000,
+    "checkpoint_debug_frames": 10000,
+    "E_decay": 0,
+    "G_optimizer_type": "adamw",
+    "G_optimizer_lr": 0.0001,
+    "G_optimizer_betas": [
+      0.9,
+      0.99
+    ],
+    "G_optimizer_wd": 0,
+    "G_optimizer_clipgrad": 0.5,
+    "G_optimizer_reuse": true,
+    "fix_iter": 900000,
+    "fix_lr_mul": 0.1,
+    "fix_keys": [
+      "spynet"
+    ],
+    "total_iter": 1000000,
+    "G_scheduler_type": "CosineAnnealingRestartLR",
+    "G_scheduler_periods": [
+      1000000
+    ],
+    "G_scheduler_restart_weights": [
+      1
+    ],
+    "G_scheduler_eta_min": 1e-07,
+    "G_regularizer_orthstep": null,
+    "G_regularizer_clipstep": null,
+    "G_param_strict": true,
+    "E_param_strict": true,
+    "checkpoint_test": 5000,
+    "checkpoint_save": 5000,
+    "checkpoint_print": 200,
+    "F_feature_layer": 34,
+    "F_weights": 1.0,
+    "F_lossfn_type": "l1",
+    "F_use_input_norm": true,
+    "F_use_range_norm": false,
+    "use_amp": true,
+    "runtime": {
+      "cudnn_benchmark": true,
+      "allow_tf32": true,
+      "matmul_precision": "high",
+      "dataloader": {
+        "pin_memory": true,
+        "persistent_workers": true,
+        "prefetch_factor": 2,
+        "val_num_workers": 4
+      }
+    }
+  },
+  "val": {
+    "save_img": false,
+    "pad_seq": false,
+    "flip_seq": false,
+    "center_frame_only": false,
+    "num_frame_testing": 0,
+    "num_frame_overlapping": 0,
+    "window_size": [
+      1,
+      1,
+      1
+    ]
+  },
+  "opt_path": "/linkhome/rech/gennip01/ura93tx/Research/KAIR/options/elvsr/flow_refine_v2.json",
+  "is_train": true,
+  "merge_bn": false,
+  "merge_bn_startpoint": -1,
+  "num_gpu": 4,
+  "rank": 0,
+  "world_size": 4
+}

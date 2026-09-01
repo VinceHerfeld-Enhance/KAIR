@@ -317,19 +317,33 @@ class ModelELVSR(ModelPlain):
         Returns:
             flow: [B, H, W, 2] (last-dim convention matching the corrector).
         """
-        # RAFT expects [B, 3, H, W] in [0, 1] with H, W divisible by 8
+        # RAFT expects H, W divisible by 8, and its correlation pyramid additionally
+        # needs feature maps >= 16px, i.e. input >= 128px (the feature extractor
+        # downsamples by 8) -- below that torchvision's RAFT raises outright.
+        # Fixed-scale training always fed this a constant 256px GT crop, so neither
+        # constraint ever bound; arbitrary-scale crops can be as small as
+        # round(lq_patch * scale_lo) (e.g. 77px), so both need enforcing now. Same
+        # upscale-then-rescale trick as RaftFlowWrapper.forward in
+        # rvrt/network_rvrt.py, which already handles this for the encoder's own
+        # RAFT instance -- mirrored here rather than inventing a second convention.
+        # When h, w are already a multiple of 8 and >= min_size (the case this ran
+        # under before), hw == h and ww == w and behavior is unchanged.
         h, w = img1.shape[2:]
-        pad_h = (8 - h % 8) % 8
-        pad_w = (8 - w % 8) % 8
-        if pad_h > 0 or pad_w > 0:
-            img1 = F.pad(img1, (0, pad_w, 0, pad_h), mode="replicate")
-            img2 = F.pad(img2, (0, pad_w, 0, pad_h), mode="replicate")
+        min_size = 128
+        hw = max(((h + 7) // 8) * 8, min_size)
+        ww = max(((w + 7) // 8) * 8, min_size)
+        resize = (hw, ww) != (h, w)
+        if resize:
+            img1 = F.interpolate(img1, size=(hw, ww), mode="bilinear", align_corners=False)
+            img2 = F.interpolate(img2, size=(hw, ww), mode="bilinear", align_corners=False)
 
         flow_list = self.raft_model(img1, img2)
-        flow = flow_list[-1]  # [B, 2, H_pad, W_pad]
+        flow = flow_list[-1]  # [B, 2, hw, ww]
 
-        if pad_h > 0 or pad_w > 0:
-            flow = flow[:, :, :h, :w]
+        if resize:
+            flow = F.interpolate(flow, size=(h, w), mode="bilinear", align_corners=False)
+            flow[:, 0] *= float(w) / float(ww)
+            flow[:, 1] *= float(h) / float(hw)
 
         return flow.permute(0, 2, 3, 1)  # [B, H, W, 2]
 
