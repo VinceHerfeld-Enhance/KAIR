@@ -551,11 +551,64 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                 wandb.log({f"train/{k}": v for k, v in logs.items()}, step=current_step)
                 wandb.log({"train/lr": model.current_learning_rate()}, step=current_step)
 
+            # The training step proper ends here. Everything below (debug frames,
+            # checkpointing, validation) is periodic and billed separately, so a
+            # save/validate iteration does not silently inflate step_time.
+            core_end = time.perf_counter()
+            timing["step_time"] += core_end - body_start
+            timing["n"] += 1
+
+            # -------------------------------
+            # 4b) debug: save train frames
+            # -------------------------------
+            debug_every = opt["train"]["checkpoint_debug_frames"] if opt["train"] else None
+            if debug_every and current_step % debug_every == 0 and is_main:
+                visuals = model.current_visuals()  # L: [T_in,C,H,W], E: [T_out,C,H,W], H: [T_out,C,H,W]
+                debug_dir = os.path.join(opt["path"]["images"], "debug_train")
+                for key in ["L", "E", "H"]:
+                    if key not in visuals:
+                        continue
+                    frames = visuals[key].clamp_(0, 1).numpy()
+                    out_dir = os.path.join(debug_dir, f"iter_{current_step:08d}", key)
+                    os.makedirs(out_dir, exist_ok=True)
+                    for fi in range(frames.shape[0]):
+                        img = frames[fi]
+                        if img.ndim == 3:
+                            img = np.transpose(img[[2, 1, 0], :, :], (1, 2, 0))
+                        img = (img * 255.0).round().astype(np.uint8)
+                        cv2.imwrite(os.path.join(out_dir, f"{fi:04d}.png"), img)
+                logger.info(f"Debug train frames saved to {debug_dir}/iter_{current_step:08d}/")
+
+            # -------------------------------
+            # 5) save model
+            # -------------------------------
+            if current_step % opt["train"]["checkpoint_save"] == 0 and is_main:
+                logger.info("Saving the model.")
+                # save_network unwraps the DDP-wrapped netG (get_bare_model), so
+                # checkpoints stay compatible with single-GPU / non-DDP loading.
+                model.save(current_step)
+
+            # -------------------------------
+            # 6) testing (only on main process)
+            # -------------------------------
+            if current_step % opt["train"]["checkpoint_test"] == 0 and is_main:
+                if test_loader is not None:
+                    saved_fixed = _run_validation(
+                        model, test_loader, opt, logger, epoch, current_step, tsf, saved_fixed
+                    )
+
+            body_end = time.perf_counter()
+            timing["val_save"] += body_end - core_end
+
             # -------------------------------
             # 4a) step-time / memory instrumentation
             # -------------------------------
-            # Flushed on the same cadence as the loss logging above, but the reset
-            # happens on EVERY rank so the running means stay comparable across ranks.
+            # Placed at the very END of the body on purpose. Flushing earlier read
+            # timing["n"] before the step_time/n increment below, so opt_time had one
+            # more sample than step_time and came out inflated by (n+1)/n -- which is
+            # how a log line ended up reporting opt 1.375s inside a 1.371s step. Here
+            # all five accumulators carry the same count.
+            # The reset happens on EVERY rank so the running means stay comparable.
             if current_step % opt["train"]["checkpoint_print"] == 0:
                 n = max(1, timing["n"])
                 step_t = timing["step_time"] / n
@@ -566,7 +619,9 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                 # training: the other ranks block at the next DDP allreduce.
                 val_t = timing["val_save"] / n
                 # Whatever is left is Python/logging overhead in the loop body.
-                other_t = max(0.0, step_t - opt_t)
+                # NOT clamped: a negative value means the accumulators have drifted
+                # out of step, and that should be visible rather than hidden.
+                other_t = step_t - opt_t
                 if is_main:
                     peak_alloc = peak_reserved = 0.0
                     if torch.cuda.is_available():
@@ -618,54 +673,6 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                     torch.cuda.reset_peak_memory_stats()
                 timing = {"data_wait": 0.0, "step_time": 0.0, "opt_time": 0.0, "val_save": 0.0, "n": 0}
 
-            # The training step proper ends here. Everything below (debug frames,
-            # checkpointing, validation) is periodic and billed separately, so a
-            # save/validate iteration does not silently inflate step_time.
-            core_end = time.perf_counter()
-            timing["step_time"] += core_end - body_start
-            timing["n"] += 1
-
-            # -------------------------------
-            # 4b) debug: save train frames
-            # -------------------------------
-            debug_every = opt["train"]["checkpoint_debug_frames"] if opt["train"] else None
-            if debug_every and current_step % debug_every == 0 and is_main:
-                visuals = model.current_visuals()  # L: [T_in,C,H,W], E: [T_out,C,H,W], H: [T_out,C,H,W]
-                debug_dir = os.path.join(opt["path"]["images"], "debug_train")
-                for key in ["L", "E", "H"]:
-                    if key not in visuals:
-                        continue
-                    frames = visuals[key].clamp_(0, 1).numpy()
-                    out_dir = os.path.join(debug_dir, f"iter_{current_step:08d}", key)
-                    os.makedirs(out_dir, exist_ok=True)
-                    for fi in range(frames.shape[0]):
-                        img = frames[fi]
-                        if img.ndim == 3:
-                            img = np.transpose(img[[2, 1, 0], :, :], (1, 2, 0))
-                        img = (img * 255.0).round().astype(np.uint8)
-                        cv2.imwrite(os.path.join(out_dir, f"{fi:04d}.png"), img)
-                logger.info(f"Debug train frames saved to {debug_dir}/iter_{current_step:08d}/")
-
-            # -------------------------------
-            # 5) save model
-            # -------------------------------
-            if current_step % opt["train"]["checkpoint_save"] == 0 and is_main:
-                logger.info("Saving the model.")
-                # save_network unwraps the DDP-wrapped netG (get_bare_model), so
-                # checkpoints stay compatible with single-GPU / non-DDP loading.
-                model.save(current_step)
-
-            # -------------------------------
-            # 6) testing (only on main process)
-            # -------------------------------
-            if current_step % opt["train"]["checkpoint_test"] == 0 and is_main:
-                if test_loader is not None:
-                    saved_fixed = _run_validation(
-                        model, test_loader, opt, logger, epoch, current_step, tsf, saved_fixed
-                    )
-
-            body_end = time.perf_counter()
-            timing["val_save"] += body_end - core_end
 
         epoch += 1
 
