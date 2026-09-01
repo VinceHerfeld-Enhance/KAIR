@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --qos=qos_gpu_h100-t4
-#SBATCH --cpus-per-task=24
+#SBATCH --cpus-per-task=32
 #SBATCH --gres=gpu:2
 #SBATCH --tasks-per-node=1
 #SBATCH --nodes=1
 #SBATCH -C h100
-#SBATCH --time=100:00:00
+#SBATCH --time=99:59:00
 
 cd ${SLURM_SUBMIT_DIR} 
 

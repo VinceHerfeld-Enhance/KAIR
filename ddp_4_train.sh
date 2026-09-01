@@ -1,11 +1,13 @@
 #!/bin/bash
-#SBATCH --qos=qos_gpu_h100-t4
+#SBATCH --partition=gpu_p6            
 #SBATCH --cpus-per-task=48
 #SBATCH --gres=gpu:4
+#SBATCH --qos=qos_gpu_h100-t4
 #SBATCH --tasks-per-node=1
 #SBATCH --nodes=1
 #SBATCH -C h100
-#SBATCH --time=100:00:00
+#SBATCH --hint=nomultithread
+#SBATCH --time=99:59:00
 
 cd ${SLURM_SUBMIT_DIR} 
 
@@ -19,10 +21,13 @@ module load pytorch-gpu/py3/2.8.0
 # Uncomment to load custom packages
 source /linkhome/rech/gennip01/ura93tx/storage/.venv/bin/activate
 
-export PYTHONPATH=/linkhome/rech/gennip01/ura93tx/Research/VSR/src:$PYTHONPATH
-
 # set WANDB offline mode
 export WANDB_MODE=offline
+
+# Reduces allocator fragmentation from cycling ~180 distinct crop sizes (closes
+# a ~17GB reserved-vs-allocated gap; see stvsr_speedup.out). Allocator-only,
+# no numerical effect.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 OPT=$1
 
