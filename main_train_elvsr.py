@@ -3,6 +3,7 @@ import os.path
 import math
 import argparse
 import re
+import time
 
 import random
 import cv2
@@ -208,6 +209,17 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--opt", type=str, default=json_path, help="Path to option JSON file.")
+    parser.add_argument(
+        "--profile-steps",
+        type=int,
+        default=0,
+        help=(
+            "For the first N iterations only, torch.cuda.synchronize() around "
+            "optimize_parameters so the logged opt_time is true GPU time rather than "
+            "launch-queue time. Off by default: a per-step synchronize is itself a "
+            "cost this instrumentation exists to find."
+        ),
+    )
     args = parser.parse_args()
 
     opt = option.parse(args.opt, is_train=True)
@@ -405,13 +417,38 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     saved_fixed = False  # avoid saving the same fixed test frames multiple times
     total_iter = opt["train"]["total_iter"]
     epoch = 0
+
+    # ----------------------------------------
+    # Step-time instrumentation
+    # ----------------------------------------
+    # There was no timing anywhere in this loop, so "training is slow" could not be
+    # attributed: the STVSRNet profiler (VSR/scripts/profile_stvsr_step.py) measures
+    # the *network*, explicitly excluding the RAFT teacher, the flow-supervision
+    # losses and the dataloader. These three counters split the wall clock into
+    # data_wait / opt_time / the Python remainder.
+    #
+    # Cost: two perf_counter calls per iteration and float adds. Nothing is read back
+    # from the GPU here — the flush below reuses the existing checkpoint_print gate,
+    # so no synchronisation is added to the hot path.
+    timing = {"data_wait": 0.0, "step_time": 0.0, "opt_time": 0.0, "val_save": 0.0, "n": 0}
+    profile_steps = max(0, int(args.profile_steps))
+    body_end = time.perf_counter()
+
     while current_step < total_iter:  # keep running
 
         # Accelerate's dataloader handles setting the epoch for the internal sampler
         if hasattr(train_loader, "set_epoch"):
             train_loader.set_epoch(epoch)
 
+        body_end = time.perf_counter()  # epoch boundary: don't bill loader startup to data_wait
+
         for i, train_data in enumerate(train_loader):
+
+            # Time spent blocked on the loader: everything between the end of the
+            # previous body and the arrival of this batch. Non-zero here means the
+            # prefetch queue drained, i.e. the step is data-bound.
+            body_start = time.perf_counter()
+            timing["data_wait"] += body_start - body_end
 
             current_step += 1
             if current_step >= total_iter:
@@ -485,7 +522,19 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
             # -------------------------------
             # 3) optimize parameters
             # -------------------------------
+            # --profile-steps N: for the first N iterations, bracket with
+            # synchronize() so opt_time is real GPU time instead of the time taken to
+            # queue the launches. Off by default.
+            sync_this_step = profile_steps and current_step <= profile_steps and torch.cuda.is_available()
+            if sync_this_step:
+                torch.cuda.synchronize()
+            opt_start = time.perf_counter()
+
             model.optimize_parameters(current_step)
+
+            if sync_this_step:
+                torch.cuda.synchronize()
+            timing["opt_time"] += time.perf_counter() - opt_start
 
             # -------------------------------
             # 4) training information
@@ -501,6 +550,80 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                 logger.info(message)
                 wandb.log({f"train/{k}": v for k, v in logs.items()}, step=current_step)
                 wandb.log({"train/lr": model.current_learning_rate()}, step=current_step)
+
+            # -------------------------------
+            # 4a) step-time / memory instrumentation
+            # -------------------------------
+            # Flushed on the same cadence as the loss logging above, but the reset
+            # happens on EVERY rank so the running means stay comparable across ranks.
+            if current_step % opt["train"]["checkpoint_print"] == 0:
+                n = max(1, timing["n"])
+                step_t = timing["step_time"] / n
+                data_t = timing["data_wait"] / n
+                opt_t = timing["opt_time"] / n
+                # Checkpointing + validation, amortised over the window. Validation is
+                # rank-0-only with no barrier, so its whole wall clock serialises into
+                # training: the other ranks block at the next DDP allreduce.
+                val_t = timing["val_save"] / n
+                # Whatever is left is Python/logging overhead in the loop body.
+                other_t = max(0.0, step_t - opt_t)
+                if is_main:
+                    peak_alloc = peak_reserved = 0.0
+                    if torch.cuda.is_available():
+                        peak_alloc = torch.cuda.max_memory_allocated() / 2**30
+                        peak_reserved = torch.cuda.max_memory_reserved() / 2**30
+                    # gt_size is the arbitrary-scale sampler's realised HR crop for this
+                    # step (round(lq_patch * scale)); absent in fixed-scale configs. It is
+                    # a CPU tensor straight off the loader, so reading it costs no sync.
+                    gt_side = None
+                    if "gt_size" in train_data:
+                        gt_side = int(train_data["gt_size"].reshape(-1)[0])
+                    # Wall clock per iteration includes the amortised save/validation cost.
+                    wall_t = step_t + data_t + val_t
+                    iters_per_hour = 3600.0 / wall_t if wall_t > 0 else 0.0
+                    logger.info(
+                        "<iter:{:8,d}> wall: {:.3f}s = step {:.3f}s (opt {:.3f}s + other {:.3f}s) "
+                        "+ data_wait {:.3f}s + save/val {:.3f}s | {:,.0f} it/h "
+                        "| peak mem {:.2f}/{:.2f} GiB (alloc/reserved){}{}".format(
+                            current_step,
+                            wall_t,
+                            step_t,
+                            opt_t,
+                            other_t,
+                            data_t,
+                            val_t,
+                            iters_per_hour,
+                            peak_alloc,
+                            peak_reserved,
+                            f" | gt_size {gt_side}" if gt_side is not None else "",
+                            " | SYNCED" if profile_steps and current_step <= profile_steps else "",
+                        )
+                    )
+                    wandb.log(
+                        {
+                            "perf/wall_time_s": wall_t,
+                            "perf/step_time_s": step_t,
+                            "perf/data_wait_s": data_t,
+                            "perf/opt_time_s": opt_t,
+                            "perf/other_time_s": other_t,
+                            "perf/save_val_time_s": val_t,
+                            "perf/iters_per_hour": iters_per_hour,
+                            "perf/peak_mem_alloc_gib": peak_alloc,
+                            "perf/peak_mem_reserved_gib": peak_reserved,
+                            **({"perf/gt_size": gt_side} if gt_side is not None else {}),
+                        },
+                        step=current_step,
+                    )
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
+                timing = {"data_wait": 0.0, "step_time": 0.0, "opt_time": 0.0, "val_save": 0.0, "n": 0}
+
+            # The training step proper ends here. Everything below (debug frames,
+            # checkpointing, validation) is periodic and billed separately, so a
+            # save/validate iteration does not silently inflate step_time.
+            core_end = time.perf_counter()
+            timing["step_time"] += core_end - body_start
+            timing["n"] += 1
 
             # -------------------------------
             # 4b) debug: save train frames
@@ -541,6 +664,9 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                         model, test_loader, opt, logger, epoch, current_step, tsf, saved_fixed
                     )
 
+            body_end = time.perf_counter()
+            timing["val_save"] += body_end - core_end
+
         epoch += 1
 
     if is_main:
@@ -559,11 +685,15 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
 def _run_validation(model, test_loader, opt, logger, epoch, current_step, tsf, saved_fixed):
     """Run validation loop, compute metrics, log to wandb. Returns updated saved_fixed."""
 
+    # SSIM is deliberately not computed here. PSNR-Y is the only training-time signal
+    # used to steer a run; every other metric (SSIM, temporal consistency, ...) is
+    # computed at benchmark time by ``vsr.benchmark``, which is the authoritative path.
+    # numpy SSIM over full HR frames, run twice per frame (RGB + Y), was the bulk of
+    # validation cost -- and validation is rank-0-only with no barrier, so its whole
+    # wall clock serialises into training (the other ranks block at the next allreduce).
     test_results = OrderedDict()
     test_results["psnr"] = []
-    test_results["ssim"] = []
     test_results["psnr_y"] = []
-    test_results["ssim_y"] = []
 
     test_list_dir = opt["datasets"]["test"].get("test_list_dir", None) if opt["datasets"]["test"] else None
 
@@ -620,9 +750,7 @@ def _run_validation(model, test_loader, opt, logger, epoch, current_step, tsf, s
 
         test_results_folder = OrderedDict()
         test_results_folder["psnr"] = []
-        test_results_folder["ssim"] = []
         test_results_folder["psnr_y"] = []
-        test_results_folder["ssim_y"] = []
 
         for j in range(output.shape[0]):
             # -----------------------
@@ -641,7 +769,7 @@ def _run_validation(model, test_loader, opt, logger, epoch, current_step, tsf, s
                 cv2.imwrite(f"{save_dir}/{folder[0]}/{seq_}_{current_step:d}.png", img)
 
             # -----------------------
-            # calculate PSNR / SSIM
+            # calculate PSNR / PSNR-Y
             # -----------------------
             if gt is not None:
                 img_gt = gt[j, ...].clamp_(0, 1).numpy()
@@ -651,49 +779,40 @@ def _run_validation(model, test_loader, opt, logger, epoch, current_step, tsf, s
                 img_gt = np.squeeze(img_gt)
 
                 test_results_folder["psnr"].append(util.calculate_psnr(img, img_gt, border=0))
-                test_results_folder["ssim"].append(util.calculate_ssim(img, img_gt, border=0))
                 if img_gt.ndim == 3:  # RGB image
                     img = util.bgr2ycbcr(img.astype(np.float32) / 255.0) * 255.0
                     img_gt = util.bgr2ycbcr(img_gt.astype(np.float32) / 255.0) * 255.0
                     test_results_folder["psnr_y"].append(util.calculate_psnr(img, img_gt, border=0))
-                    test_results_folder["ssim_y"].append(util.calculate_ssim(img, img_gt, border=0))
                 else:
                     test_results_folder["psnr_y"] = test_results_folder["psnr"]
-                    test_results_folder["ssim_y"] = test_results_folder["ssim"]
 
         if gt is not None and len(test_results_folder["psnr"]) > 0:
             psnr = sum(test_results_folder["psnr"]) / len(test_results_folder["psnr"])
-            ssim = sum(test_results_folder["ssim"]) / len(test_results_folder["ssim"])
             psnr_y = sum(test_results_folder["psnr_y"]) / len(test_results_folder["psnr_y"])
-            ssim_y = sum(test_results_folder["ssim_y"]) / len(test_results_folder["ssim_y"])
 
             logger.info(
-                "Testing {:20s} ({:2d}/{}) - PSNR: {:.2f} dB; SSIM: {:.4f}; "
-                "PSNR_Y: {:.2f} dB; SSIM_Y: {:.4f}".format(folder[0], idx, len(test_loader), psnr, ssim, psnr_y, ssim_y)
+                "Testing {:20s} ({:2d}/{}) - PSNR: {:.2f} dB; PSNR_Y: {:.2f} dB".format(
+                    folder[0], idx, len(test_loader), psnr, psnr_y
+                )
             )
             test_results["psnr"].append(psnr)
-            test_results["ssim"].append(ssim)
             test_results["psnr_y"].append(psnr_y)
-            test_results["ssim_y"].append(ssim_y)
         else:
             logger.info("Testing {:20s}  ({:2d}/{})".format(folder[0], idx, len(test_loader)))
 
-    # summarize psnr/ssim
+    # summarize psnr
     if len(test_results["psnr"]) > 0:
         ave_psnr = sum(test_results["psnr"]) / len(test_results["psnr"])
-        ave_ssim = sum(test_results["ssim"]) / len(test_results["ssim"])
         ave_psnr_y = sum(test_results["psnr_y"]) / len(test_results["psnr_y"])
-        ave_ssim_y = sum(test_results["ssim_y"]) / len(test_results["ssim_y"])
         logger.info(
-            "<epoch:{:3d}, iter:{:8,d} Average PSNR: {:.2f} dB; SSIM: {:.4f}; "
-            "PSNR_Y: {:.2f} dB; SSIM_Y: {:.4f}".format(epoch, current_step, ave_psnr, ave_ssim, ave_psnr_y, ave_ssim_y)
+            "<epoch:{:3d}, iter:{:8,d} Average PSNR: {:.2f} dB; PSNR_Y: {:.2f} dB".format(
+                epoch, current_step, ave_psnr, ave_psnr_y
+            )
         )
         wandb.log(
             {
                 "val/PSNR": ave_psnr,
-                "val/SSIM": ave_ssim,
                 "val/PSNR_Y": ave_psnr_y,
-                "val/SSIM_Y": ave_ssim_y,
             },
             step=current_step,
         )

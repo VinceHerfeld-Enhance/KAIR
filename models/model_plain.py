@@ -260,6 +260,65 @@ class ModelPlain(ModelBase):
         return self.G_lossfn_weight * self.G_lossfn(self.E, self.H)
 
     # ----------------------------------------
+    # non-finite loss guard (without a per-step device sync)
+    # ----------------------------------------
+    def _check_loss_finite(self, G_loss, current_step):
+        """Guard against a non-finite loss without syncing the device every step.
+
+        The original form was ``if not torch.isfinite(G_loss):`` — reading a GPU
+        scalar inside a Python ``if``, i.e. a device-to-host sync on *every*
+        iteration. STVSRNet's step is launch-bound (the RVRT encoder alone issues
+        thousands of small kernels and is 53% of the forward), so draining the launch
+        queue once per step costs more than the check is worth.
+
+        Instead the non-finite condition is OR-ed into a sticky device-side flag each
+        step (two tiny kernels, no sync) and read back only every ``interval`` steps.
+        A NaN is then reported as "within the last ``interval`` steps" rather than at
+        the exact step. That costs diagnostic precision but not safety: once a NaN has
+        reached ``optimizer.step()`` the weights *and* the Adam moments are already
+        unrecoverable, so this check never rescued a run — it only ever told you the
+        run was dead.
+
+        ``train.loss_finite_check_interval``: ``1`` restores the old exact,
+        sync-every-step behaviour; ``0`` disables the guard; default is
+        ``train.checkpoint_print`` so it rides the existing logging cadence.
+        """
+        interval = self.opt_train.get("loss_finite_check_interval", None)
+        if interval is None:
+            interval = self.opt["train"].get("checkpoint_print", 200)
+        interval = int(interval)
+        if interval <= 0:
+            return
+
+        if interval == 1:
+            if not torch.isfinite(G_loss):
+                raise FloatingPointError(
+                    f"Non-finite G_loss ({G_loss.item()}) at step {current_step}; "
+                    "aborting before optimizer step corrupts the weights."
+                )
+            return
+
+        flag = getattr(self, "_nonfinite_flag", None)
+        if flag is None or flag.device != G_loss.device:
+            flag = torch.zeros((), dtype=torch.bool, device=G_loss.device)
+            self._nonfinite_flag = flag
+            self._nonfinite_window_start = current_step
+        # Sticky OR, entirely on device — no readback.
+        flag.logical_or_(~torch.isfinite(G_loss.detach()))
+
+        if current_step % interval == 0:
+            hit = bool(flag.item())  # the one sync, once per `interval` steps
+            window_start = getattr(self, "_nonfinite_window_start", current_step)
+            flag.zero_()
+            self._nonfinite_window_start = current_step + 1
+            if hit:
+                raise FloatingPointError(
+                    f"Non-finite G_loss somewhere in steps {window_start}..{current_step}; "
+                    "aborting. Set train.loss_finite_check_interval=1 to identify the exact "
+                    "step (costs one device sync per iteration)."
+                )
+
+    # ----------------------------------------
     # update parameters and get loss
     # ----------------------------------------
     def optimize_parameters(self, current_step):
@@ -276,12 +335,7 @@ class ModelPlain(ModelBase):
 
         # Fail loud on a non-finite loss instead of letting NaN/inf flow through
         # backward() and silently corrupt the weights (Adam moments never recover).
-        # This surfaces upstream numerical bugs at the step they first appear.
-        if not torch.isfinite(G_loss):
-            raise FloatingPointError(
-                f"Non-finite G_loss ({G_loss.item()}) at step {current_step}; "
-                "aborting before optimizer step corrupts the weights."
-            )
+        self._check_loss_finite(G_loss, current_step)
 
         if accelerator is not None:
             accelerator.backward(G_loss)

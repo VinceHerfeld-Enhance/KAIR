@@ -155,11 +155,19 @@ class ModelBase:
 
         cfg.setdefault("enable", False)
         cfg.setdefault("backend", "inductor")
-        cfg.setdefault("mode", "reduce-overhead")
         cfg.setdefault("dynamic", True)
         cfg.setdefault("fullgraph", False)
         cfg.setdefault("disable", False)
         cfg.setdefault("cuda_only", True)
+
+        # `mode` and `dynamic` must agree. "reduce-overhead" enables CUDA-graph
+        # capture, which requires fixed tensor shapes and addresses; `dynamic=True`
+        # exists precisely because shapes vary (arbitrary-scale training resizes the
+        # HR side every step, ~180 distinct `round(lq_patch * scale)` values). The old
+        # defaults paired the two, so simply flipping `enable` on gave graph-capture
+        # churn on a config that can never hold a graph. Default the mode off `dynamic`
+        # instead; an explicit `mode` in the config still wins.
+        cfg.setdefault("mode", "default" if bool(cfg.get("dynamic", True)) else "reduce-overhead")
         return cfg
 
     def maybe_compile_forward(self, module, module_name="module", compile_cfg=None):
@@ -184,24 +192,28 @@ class ModelBase:
         if getattr(bare, "_forward_is_compiled", False):
             return module
 
+        # Resolve once so the log line cannot disagree with what was compiled. Same
+        # mode/dynamic coupling as _torch_compile_cfg, for callers that pass an
+        # explicit compile_cfg and bypass it.
+        backend = cfg.get("backend", "inductor")
+        dynamic = bool(cfg.get("dynamic", True))
+        mode = cfg.get("mode", "default" if dynamic else "reduce-overhead")
+        fullgraph = bool(cfg.get("fullgraph", False))
+
         try:
             bare.forward = torch.compile(
                 bare.forward,
-                backend=cfg.get("backend", "inductor"),
-                mode=cfg.get("mode", "reduce-overhead"),
-                dynamic=bool(cfg.get("dynamic", True)),
-                fullgraph=bool(cfg.get("fullgraph", False)),
+                backend=backend,
+                mode=mode,
+                dynamic=dynamic,
+                fullgraph=fullgraph,
                 disable=bool(cfg.get("disable", False)),
             )
             bare._forward_is_compiled = True
             print(
                 "[torch.compile] Compiled {}.forward "
                 "(backend={}, mode={}, dynamic={}, fullgraph={})".format(
-                    module_name,
-                    cfg.get("backend", "inductor"),
-                    cfg.get("mode", "reduce-overhead"),
-                    bool(cfg.get("dynamic", True)),
-                    bool(cfg.get("fullgraph", False)),
+                    module_name, backend, mode, dynamic, fullgraph
                 )
             )
         except Exception as exc:

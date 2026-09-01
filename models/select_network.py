@@ -328,7 +328,11 @@ def define_G(opt):
             learned_surrogate_blend=opt_net.get("learned_surrogate_blend", False),
             interp_flow_mode=opt_net.get("interp_flow_mode", "quadratic"),
             unified_prior_adapter=opt_net.get("unified_prior_adapter", True),
-            use_anti_ghost=opt_net.get("use_anti_ghost", True),
+            # Retired with the single-decode-path refactor: the splat weight comes from
+            # the trajectory's own visibility path, so STVSRNet only accepts False. The
+            # default has to be False here too, or a config that never mentioned the key
+            # would fail to build.
+            use_anti_ghost=opt_net.get("use_anti_ghost", False),
             ag_photometric_cue=opt_net.get("ag_photometric_cue", False),
             ag_source_select=opt_net.get("ag_source_select", False),
             window_motion_mode=opt_net.get("window_motion_mode", "compose"),
@@ -364,6 +368,10 @@ def define_G(opt):
             focus_blur=opt_net.get("focus_blur", True),
             coverage_to_prior=opt_net.get("coverage_to_prior", False),
             per_window_frame_z=opt_net.get("per_window_frame_z", False),
+            # Output frames sharing one splat + prior call. 0 (default) = one call per
+            # frame, the original code path. k >= 1 = up to k frames per call, -1 = all.
+            # Speed/memory only: numerically equivalent at every setting.
+            decode_chunk=opt_net.get("decode_chunk", 0),
         )
     elif net_type == "bfstvsr":
         # BF-STVSR (CVPR 2025) trained from scratch inside KAIR. Built via the VSR
