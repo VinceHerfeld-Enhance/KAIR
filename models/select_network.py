@@ -372,6 +372,10 @@ def define_G(opt):
             # frame, the original code path. k >= 1 = up to k frames per call, -1 = all.
             # Speed/memory only: numerically equivalent at every setting.
             decode_chunk=opt_net.get("decode_chunk", 0),
+            # Eval-time override. Validation decodes a whole clip at the full frame
+            # (batch 1), ~4.7x the per-call footprint of a training chunk at the same
+            # k, so a training value of -1 OOMs at the first checkpoint_test.
+            decode_chunk_eval=opt_net.get("decode_chunk_eval", None),
         )
     elif net_type == "bfstvsr":
         # BF-STVSR (CVPR 2025) trained from scratch inside KAIR. Built via the VSR
