@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
 from models.model_plain import ModelPlain
+from vsr.video_models.model_loading_functions import _drop_retired_state_dict_keys
 
 
 class ModelELVSR(ModelPlain):
@@ -985,6 +986,7 @@ class ModelELVSR(ModelPlain):
         state_dict = torch.load(load_path)
         if param_key in state_dict.keys():
             state_dict = state_dict[param_key]
+        state_dict = _drop_retired_state_dict_keys(state_dict, model_name="G")
         self._print_different_keys_loading(network, state_dict, strict)
         network.load_state_dict(state_dict, strict=strict)
 

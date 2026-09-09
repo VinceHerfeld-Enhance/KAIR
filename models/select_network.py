@@ -366,6 +366,16 @@ def define_G(opt):
             bspline_coupling_hidden=opt_net.get("bspline_coupling_hidden", 64),
             fill_holes=opt_net.get("fill_holes", True),
             focus_blur=opt_net.get("focus_blur", True),
+            # Cap on the scale the splat targets; the rest is a bilinear resize. null
+            # (default) splats straight to the requested grid, as before. Set to 4 to keep
+            # the fill blur and splat coverage in the regime the prior was trained on when
+            # evaluating above the training scale range.
+            max_splat_sf=opt_net.get("max_splat_sf", None),
+            # Caps the whole splat+prior pipeline instead of just the splat, resizing the
+            # decoded RGB. Keeps every learned component on its trained geometry, but
+            # synthesises nothing above the cap -- a diagnostic floor, not arbitrary-scale SR.
+            max_decode_sf=opt_net.get("max_decode_sf", None),
+            decode_resize_mode=opt_net.get("decode_resize_mode", "bicubic"),
             coverage_to_prior=opt_net.get("coverage_to_prior", False),
             per_window_frame_z=opt_net.get("per_window_frame_z", False),
             # Output frames sharing one splat + prior call. 0 (default) = one call per
