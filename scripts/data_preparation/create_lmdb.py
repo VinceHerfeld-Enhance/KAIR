@@ -1,4 +1,5 @@
 import argparse
+import os
 from os import path as osp
 import sys
 
@@ -370,44 +371,39 @@ def prepare_keys_reds_orig(folder_path):
     return img_path_list, keys
 
 
-def create_lmdb_for_adobe240():
-    """Create lmdb files for Adobe240fps dataset.
+def create_lmdb_for_adobe240(adobe_root, out_root, subdirs=("hr", "lr"), n_thread=12):
+    """Create lmdb files for the Adobe240fps dataset.
 
-    Usage:
-        The dataset is expected at
-        /home/vherfeld/storage/vherfeld/datasets/Adobe240
-        with sub-folders per clip containing PNG frames.
-        Remember to modify opt configurations according to your settings.
+    Args:
+        adobe_root (str): Directory holding the per-resolution frame trees, i.e.
+            ``<adobe_root>/<subdir>/<clip>/<frame>.png``. Point this at a SPLIT
+            train root (see ``split_adobe240.py``) -- this function indexes every
+            clip it finds, so pointing it at an unsplit tree puts the evaluation
+            clips into the training lmdb.
+        out_root (str): Directory the ``train_<subdir>.lmdb`` stores are written to.
+        subdirs (tuple[str]): Frame trees to convert. Default: ("hr", "lr").
+        n_thread (int): Reader threads.
     """
-    # # train hr
-    # folder_path = "/home/vherfeld/storage/vherfeld/datasets/Adobe240/hr"
-    # lmdb_path = "/home/vherfeld/storage/vherfeld/datasets/Adobe240/train_hr.lmdb"
-    # img_path_list, keys = prepare_keys_adobe240(folder_path)
-    # make_lmdb_from_imgs(
-    #     folder_path,
-    #     lmdb_path,
-    #     img_path_list,
-    #     keys,
-    #     multiprocessing_read=True,
-    #     multiprocessing_mode="stream",
-    #     n_thread=12,
-    #     multiprocessing_chunksize=16,
-    # )
-
-    # train_lr
-    folder_path = "/home/vherfeld/storage/vherfeld/datasets/Adobe240/lr"
-    lmdb_path = "/home/vherfeld/storage/vherfeld/datasets/Adobe240/train_lr.lmdb"
-    img_path_list, keys = prepare_keys_adobe240(folder_path)
-    make_lmdb_from_imgs(
-        folder_path,
-        lmdb_path,
-        img_path_list,
-        keys,
-        multiprocessing_read=True,
-        multiprocessing_mode="stream",
-        n_thread=12,
-        multiprocessing_chunksize=16,
-    )
+    os.makedirs(out_root, exist_ok=True)  # lmdb.open() will not create the parent itself
+    for subdir in subdirs:
+        folder_path = osp.join(adobe_root, subdir)
+        lmdb_path = osp.join(out_root, f"train_{subdir}.lmdb")
+        if not osp.isdir(folder_path):
+            raise FileNotFoundError(f"{folder_path} does not exist.")
+        img_path_list, keys = prepare_keys_adobe240(folder_path)
+        clips = sorted({k.split("/")[0] for k in keys})
+        print(f"[{subdir}] {folder_path} -> {lmdb_path}")
+        print(f"[{subdir}] {len(clips)} clips, {len(img_path_list)} frames")
+        make_lmdb_from_imgs(
+            folder_path,
+            lmdb_path,
+            img_path_list,
+            keys,
+            multiprocessing_read=True,
+            multiprocessing_mode="stream",
+            n_thread=n_thread,
+            multiprocessing_chunksize=16,
+        )
 
 
 def prepare_keys_adobe240(folder_path):
@@ -439,6 +435,26 @@ if __name__ == "__main__":
             "You may need to modify the corresponding configurations in codes."
         ),
     )
+    parser.add_argument(
+        "--adobe-root",
+        type=str,
+        default=None,
+        help="Adobe240 only: directory holding the hr/ and lr/ frame trees (use a SPLIT train root).",
+    )
+    parser.add_argument(
+        "--out-root",
+        type=str,
+        default=None,
+        help="Adobe240 only: directory the train_<subdir>.lmdb stores are written to.",
+    )
+    parser.add_argument(
+        "--subdirs",
+        type=str,
+        nargs="+",
+        default=["hr", "lr"],
+        help="Adobe240 only: frame trees to convert. Default: hr lr",
+    )
+    parser.add_argument("--n-thread", type=int, default=12, help="Reader threads.")
     args = parser.parse_args()
     dataset = args.dataset.lower()
     if dataset == "div2k":
@@ -460,6 +476,8 @@ if __name__ == "__main__":
     elif dataset == "reds_orig":
         create_lmdb_for_reds_orig()
     elif dataset == "adobe240":
-        create_lmdb_for_adobe240()
+        if args.adobe_root is None or args.out_root is None:
+            raise ValueError("Adobe240 requires --adobe-root and --out-root (point --adobe-root at a SPLIT train root).")
+        create_lmdb_for_adobe240(args.adobe_root, args.out_root, tuple(args.subdirs), args.n_thread)
     else:
         raise ValueError("Wrong dataset.")
