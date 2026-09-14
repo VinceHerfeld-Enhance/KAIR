@@ -16,6 +16,20 @@ class ModelELVSR(ModelPlain):
         self.fix_iter = self.opt_train.get("fix_iter", 0)
         self.fix_keys = self.opt_train.get("fix_keys", [])
         self.fix_unflagged = True
+        # ---- Warm-up freeze (independent of fix_iter/fix_keys) ----
+        # Freezes `warmup_freeze_keys` for the first `warmup_freeze_iter` steps, then
+        # releases them. Deliberately a SEPARATE pair rather than more entries in
+        # fix_keys, because fix_keys also selects the fix_lr_mul parameter group in
+        # define_optimizer() -- reusing it would silently run the warm-up modules at the
+        # flow's reduced learning rate for the whole run.
+        #
+        # Use case: re-initialise the trajectory head on top of a converged
+        # encoder/prior (e.g. the bspline_features sweep) and hold the rest still for a
+        # few thousand steps so the head learns real structure before the rest adapts.
+        self.warmup_freeze_keys = self.opt_train.get("warmup_freeze_keys", [])
+        self.warmup_freeze_iter = self.opt_train.get("warmup_freeze_iter", 0)
+        self.warmup_frozen = False
+        self.warmup_released = False
         self.tsf = int(opt["netG"].get("tsf", 1)) if opt.get("netG") else 1
         self.gt_indices = None  # (B, K) LongTensor of sparse GT positions, or None for full GT
 
@@ -765,6 +779,59 @@ class ModelELVSR(ModelPlain):
             super(ModelELVSR, self).define_optimizer()
 
     # ----------------------------------------
+    # warm-up freeze of encoder / prior
+    # ----------------------------------------
+    def _matches(self, name, keys):
+        return any([key in name for key in keys])
+
+    def _apply_warmup_freeze(self, current_step):
+        """Freeze ``warmup_freeze_keys`` for ``warmup_freeze_iter`` steps, then release.
+
+        The release deliberately skips anything matching ``fix_keys``. The optical flow
+        model lives INSIDE the encoder (its parameters are named
+        ``encoder.optical_flow_model.*``), so a warm-up key of ``"encoder"`` also matches
+        it; releasing blindly would unfreeze SpyNet and silently undo the permanent
+        ``fix_keys`` freeze that is meant to hold for the whole run.
+
+        The release test is ``>=``, not the ``==`` used by ``fix_iter``, so a run resumed
+        from a checkpoint past the threshold still ends up in the right state instead of
+        skipping the transition entirely.
+        """
+        if current_step < self.warmup_freeze_iter:
+            if not self.warmup_frozen:
+                print(
+                    f"Warm-up: freezing {self.warmup_freeze_keys} for the first "
+                    f"{self.warmup_freeze_iter} iters."
+                )
+                for name, param in self.netG.named_parameters():
+                    if self._matches(name, self.warmup_freeze_keys):
+                        param.requires_grad_(False)
+                self.warmup_frozen = True
+            return
+
+        if self.warmup_released:
+            return
+        held = []
+        for name, param in self.netG.named_parameters():
+            if not self._matches(name, self.warmup_freeze_keys):
+                continue
+            if self.fix_keys and self._matches(name, self.fix_keys):
+                # Freeze explicitly rather than merely skipping: on a run RESUMED past
+                # warmup_freeze_iter the warm-up freeze never ran, so these params would
+                # otherwise sit at their default requires_grad=True and the permanent
+                # fix_keys freeze would depend entirely on the fix_iter block above
+                # having run first. Assert the invariant here instead of inheriting it.
+                param.requires_grad_(False)
+                held.append(name)
+                continue
+            param.requires_grad_(True)
+        print(
+            f"Warm-up over at {current_step} iters: released {self.warmup_freeze_keys}"
+            + (f", still holding {len(held)} {self.fix_keys} params frozen" if held else "")
+        )
+        self.warmup_released = True
+
+    # ----------------------------------------
     # update parameters and get loss
     # ----------------------------------------
     def optimize_parameters(self, current_step):
@@ -778,6 +845,9 @@ class ModelELVSR(ModelPlain):
             elif current_step == self.fix_iter:
                 print(f"Train all the parameters from {self.fix_iter} iters.")
                 self.netG.requires_grad_(True)
+
+        if self.warmup_freeze_iter and len(self.warmup_freeze_keys) > 0:
+            self._apply_warmup_freeze(current_step)
 
         # Pre-compute RAFT pseudo-GT once and reuse it for (a) optional
         # teacher-forcing of the corrector and (b) the flow supervision loss.

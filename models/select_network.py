@@ -355,6 +355,7 @@ def define_G(opt):
             bspline_stem_nc=opt_net.get("bspline_stem_nc", [16, 16, 16, 16]),
             bspline_stem_nb=opt_net.get("bspline_stem_nb", 1),
             bspline_stem_out=opt_net.get("bspline_stem_out", 64),
+            bspline_zero_init=opt_net.get("bspline_zero_init", False),
             vis_traj_shared_coefficients=opt_net.get("vis_traj_shared_coefficients", True),
             traj_direct_coefficients=opt_net.get("traj_direct_coefficients", False),
             vis_basis=opt_net.get("vis_basis", "bspline"),
