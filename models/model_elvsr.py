@@ -50,8 +50,22 @@ class ModelELVSR(ModelPlain):
         # probability decays linearly to 0 over ``teacher_flow_decay_steps``.
         self.teacher_flow_p0 = float(self.opt_train.get("teacher_flow_p0", 0.0))
         self.teacher_flow_decay_steps = int(self.opt_train.get("teacher_flow_decay_steps", 20000))
+        # Pairwise-flow anchor: supervise the ENCODER's flow model (its pairwise flows
+        # between consecutive input frames) with the frozen RAFT teacher run on the clean
+        # HR GT of the same frames. With degraded LR inputs this is what teaches the flow
+        # model to be robust to them once it is unfrozen (fix_iter / fix_lr_mul); the
+        # constant weight keeps it tied to real motion instead of drifting toward whatever
+        # merely lowers the pixel loss. Skipped while the flow model is frozen.
+        self.lambda_pairwise_flow = float(self.opt_train.get("lambda_pairwise_flow", 0.0))
+        # Elementwise penalty of both flow losses (interp supervision + pairwise anchor):
+        # "l1" (default, the historical behaviour) or "charbonnier" (sqrt(d^2 + eps), as the
+        # pixel loss). With a tiny eps the two only differ at d ~ 0.
+        self.flow_lossfn_type = self.opt_train.get("flow_lossfn_type", "l1")
+        if self.flow_lossfn_type not in ("l1", "charbonnier"):
+            raise ValueError(f"flow_lossfn_type must be 'l1' or 'charbonnier', got {self.flow_lossfn_type!r}")
+        self.flow_charbonnier_eps = float(self.opt_train.get("flow_charbonnier_eps", 1e-6))
         self.raft_model = None
-        if self.tsf > 1 and (self.lambda_flow > 0 or self.teacher_flow_p0 > 0):
+        if self.tsf > 1 and (self.lambda_flow > 0 or self.teacher_flow_p0 > 0 or self.lambda_pairwise_flow > 0):
             self._init_raft()
         # Per-step caches populated in optimize_parameters
         self._current_pseudo_gt = None
@@ -228,6 +242,12 @@ class ModelELVSR(ModelPlain):
         if flow_loss is not None:
             self.log_dict["flow_loss"] = self._detach_log_value(flow_loss)
             G_loss = G_loss + flow_loss
+
+        # ---- Pairwise-flow anchor for the encoder's flow model (robustness to degraded LR) ----
+        pairwise_loss = self._compute_pairwise_flow_loss()
+        if pairwise_loss is not None:
+            self.log_dict["pairwise_flow_loss"] = self._detach_log_value(pairwise_loss)
+            G_loss = G_loss + pairwise_loss
 
         # ---- V-JEPA video perceptual loss ----
         vjepa_loss = self._compute_vjepa_loss()
@@ -518,8 +538,13 @@ class ModelELVSR(ModelPlain):
         # Decay toward the floor, not to 0, so a residual RAFT anchor remains.
         return max(self.flow_loss_min_weight, self.lambda_flow * frac)
 
-    @staticmethod
-    def _min_k_flow_loss(pred, gt):
+    def _flow_penalty(self, diff):
+        """Elementwise flow penalty per ``flow_lossfn_type``."""
+        if self.flow_lossfn_type == "charbonnier":
+            return torch.sqrt(diff * diff + self.flow_charbonnier_eps)
+        return diff.abs()
+
+    def _min_k_flow_loss(self, pred, gt):
         """Hindsight (multiple-choice) L1 between predicted flow(s) and the teacher.
 
         Args:
@@ -529,15 +554,15 @@ class ModelELVSR(ModelPlain):
 
         Takes a per-pixel ``min`` over the K hypotheses so only the
         best-matching one is pulled toward the teacher (Guzman-Rivera et al.,
-        MCL), leaving the others free to specialise. Reduces *exactly* to plain
-        L1 when ``K == 1`` (or a single flow is passed), so single-flow configs
-        are unaffected.
+        MCL), leaving the others free to specialise. Reduces *exactly* to the plain
+        elementwise loss when ``K == 1`` (or a single flow is passed), so single-flow
+        configs are unaffected. The penalty is ``_flow_penalty`` (L1 by default).
         """
         if pred.dim() == 4:
-            return F.l1_loss(pred, gt)
+            return self._flow_penalty(pred - gt).mean()
         # pred [B, K, H, W, 2], gt [B, H, W, 2]; mean over the 2 flow components
-        # keeps the scale identical to F.l1_loss in the K == 1 case.
-        d = (pred - gt.unsqueeze(1)).abs().mean(dim=-1)  # [B, K, H, W]
+        # keeps the scale identical to the single-flow case.
+        d = self._flow_penalty(pred - gt.unsqueeze(1)).mean(dim=-1)  # [B, K, H, W]
         return d.min(dim=1).values.mean()
 
     def _compute_flow_supervision_loss(self):
@@ -599,6 +624,78 @@ class ModelELVSR(ModelPlain):
         if n_terms == 0:
             return None
         return lam * total / n_terms
+
+    def _input_aligned_gt(self):
+        """HR GT frames at the input (key) times, ``[B, T_in, 3, H, W]``, or None if not all are loaded.
+
+        Same layout rules as :meth:`_compute_pseudo_gt_flows`: per-sample regime puts
+        input frame ``g`` at ``g * (S + 1)``; otherwise it sits at absolute index
+        ``g * tsf``, looked up through ``H_full_indices`` when GT was pre-subset.
+        """
+        gt = self.H_full
+        t_in = self.L.shape[1]
+        if torch.is_tensor(self.interp_steps):
+            stride = self.interp_steps.size(2) + 1
+            pos = [g * stride for g in range(t_in)]
+        else:
+            step = self.tsf if self.tsf > 1 else 1
+            if self._h_full_indices is not None:
+                idx_map = {int(a): p for p, a in enumerate(self._h_full_indices)}
+                pos = [idx_map.get(g * step) for g in range(t_in)]
+            else:
+                pos = [g * step for g in range(t_in)]
+        if any(p is None or p >= gt.shape[1] for p in pos):
+            return None
+        return gt[:, pos]
+
+    def _compute_pairwise_flow_loss(self):
+        """Flow penalty (``flow_lossfn_type``) between the encoder's pairwise flows (LR input) and RAFT on clean HR GT.
+
+        Student: ``net._aux_pairwise_flows``, both directions between consecutive input
+        frames, computed by the encoder's flow model on the (possibly degraded) LR.
+        Teacher: the separate frozen RAFT on the matching HR GT pairs, resampled to the LR
+        grid and rescaled to LR px (``_raft_flow_lr``'s convention). Returns None while the
+        encoder's flow model is frozen (no gradient to deliver, and the teacher is costly).
+        """
+        lam = self.lambda_pairwise_flow
+        if self.raft_model is None or lam <= 0:
+            return None
+        net = self.get_bare_model(self.netG)
+        flows = getattr(net, "_aux_pairwise_flows", None)
+        if flows is None or flows[0] is None or not flows[0].requires_grad:
+            return None
+        frames = self._input_aligned_gt()
+        if frames is None or frames.shape[1] < 2:
+            return None
+        p2n, n2p = flows
+        if n2p is None:  # mirror-extended input: the encoder reconstructs it by flip
+            return None
+        b, pairs = p2n.shape[:2]
+        h_lr, w_lr = p2n.shape[-2:]
+
+        first = frames[:, :-1].flatten(0, 1)
+        second = frames[:, 1:].flatten(0, 1)
+        with torch.no_grad():
+            src = torch.cat([first, second], dim=0)
+            dst = torch.cat([second, first], dim=0)
+            chunk = int(self.opt_train.get("pairwise_flow_teacher_chunk", 16))
+            teacher = torch.cat([
+                self._raft_flow(src[i:i + chunk], dst[i:i + chunk]) for i in range(0, src.shape[0], chunk)
+            ], dim=0)  # [2*B*pairs, H_hr, W_hr, 2]
+            h_hr, w_hr = teacher.shape[1:3]
+            teacher = F.interpolate(
+                teacher.permute(0, 3, 1, 2), size=(h_lr, w_lr), mode="bilinear", align_corners=False
+            )  # [2*B*pairs, 2, h, w]
+            teacher[:, 0] *= w_lr / w_hr
+            teacher[:, 1] *= h_lr / h_hr
+            t_p2n, t_n2p = teacher.view(2, b, pairs, 2, h_lr, w_lr).unbind(0)
+            t_p2n, t_n2p = t_p2n.to(p2n.device), t_n2p.to(n2p.device)  # encoder cpu_cache keeps flows on CPU
+
+        loss = 0.5 * (self._flow_penalty(p2n - t_p2n).mean() + self._flow_penalty(n2p - t_n2p).mean())
+        with torch.no_grad():
+            epe = 0.5 * ((p2n - t_p2n).norm(dim=2).mean() + (n2p - t_n2p).norm(dim=2).mean())
+        self.log_dict["pairwise_flow_epe"] = epe.item()  # LR px, comparable to raft_degradation_robustness
+        return lam * loss
 
     @staticmethod
     def _edge_aware_flow_smoothness(flow, img, order=1, edge=10.0):

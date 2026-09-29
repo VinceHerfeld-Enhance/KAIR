@@ -227,7 +227,9 @@
       "dynamic": false,
       "fullgraph": false,
       "cuda_only": true
-    }
+    },
+    "flow_lossfn_type": "charbonnier",
+    "flow_charbonnier_eps": 1e-06
   },
   "val": {
     "checkpoint_debug_frames": 10000,

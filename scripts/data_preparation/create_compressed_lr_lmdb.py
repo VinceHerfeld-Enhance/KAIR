@@ -75,6 +75,7 @@ from collections import defaultdict
 from multiprocessing import Pool
 from os import path as osp
 
+import cv2
 import lmdb
 import numpy as np
 from PIL import Image
@@ -111,11 +112,24 @@ DEFAULT_VAL_SETTINGS = [
 
 # ----------------------------------------------------------------------------- helpers
 def unpack_raw(value: bytes) -> np.ndarray:
-    """Inverse of ``pack_raw``: raw LMDB value -> HWC BGR uint8."""
-    if value[:4] != RAW_LMDB_MAGIC:
-        raise ValueError("Not a raw-uint8 LMDB value (bad magic); rebuild the HR LMDB with create_lmdb_raw.py")
-    h, w, c = np.frombuffer(value[4:HEADER_BYTES], dtype="<u4")
-    return np.frombuffer(value, dtype=np.uint8, offset=HEADER_BYTES).reshape(h, w, c)
+    """LMDB value -> HWC BGR uint8. Raw-uint8 (``create_lmdb_raw.py``) or PNG-encoded (``create_lmdb.py``)."""
+    if value[:4] == RAW_LMDB_MAGIC:
+        h, w, c = np.frombuffer(value[4:HEADER_BYTES], dtype="<u4")
+        return np.frombuffer(value, dtype=np.uint8, offset=HEADER_BYTES).reshape(h, w, c)
+    img = cv2.imdecode(np.frombuffer(value, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("LMDB value is neither raw-uint8 (RAW1) nor a decodable image")
+    return img
+
+
+def pack_value(bgr: np.ndarray, fmt: str) -> bytes:
+    """HWC BGR uint8 -> LMDB value: ``raw`` (loader ``raw_lmdb: true``) or ``png`` (``raw_lmdb: false``)."""
+    if fmt == "raw":
+        return pack_raw(bgr)[0]
+    ok, buf = cv2.imencode(".png", bgr, [cv2.IMWRITE_PNG_COMPRESSION, 1])  # lossless; level 1 as utils_lmdb
+    if not ok:
+        raise RuntimeError("PNG encode failed")
+    return buf.tobytes()
 
 
 def downscale_rgb(hr_rgb: np.ndarray, scale: int) -> np.ndarray:
@@ -172,10 +186,11 @@ def meta_info_clips(meta_info: str) -> list[str]:
 _W = {}
 
 
-def _init_worker(hr_lmdb: str, scale: int, fps: float, tsf: int, exposure_space: str):
+def _init_worker(hr_lmdb: str, scale: int, fps: float, tsf: int, exposure_space: str, lmdb_format: str):
     torch.set_num_threads(1)
+    cv2.setNumThreads(1)
     _W["env"] = lmdb.open(hr_lmdb, readonly=True, lock=False, readahead=False, meminit=False)
-    _W.update(scale=scale, fps=fps, tsf=tsf, space=exposure_space)
+    _W.update(scale=scale, fps=fps, tsf=tsf, space=exposure_space, fmt=lmdb_format)
 
 
 def _hr_rgb(txn, key: str) -> np.ndarray:
@@ -199,7 +214,7 @@ def _encode_stream(task: dict) -> dict:
         clean = np.stack(lrs)
     degraded, kbps = apply_setting(clean, setting, _W["fps"])
     per_frame = [psnr_uint8(d, c) for d, c in zip(degraded, clean)]
-    values = [pack_raw(np.ascontiguousarray(f[:, :, ::-1]))[0] for f in degraded]  # RGB -> BGR, as create_lmdb_raw
+    values = [pack_value(np.ascontiguousarray(f[:, :, ::-1]), _W["fmt"]) for f in degraded]  # RGB -> BGR
     record = {
         "clip": task["clip"], "phase": task["phase"], "n_frames": len(keys), **setting,
         "exposure": n_exp, "shutter_deg": round(360.0 * n_exp / _W["tsf"], 1),
@@ -289,11 +304,12 @@ def build_train(args) -> None:
     written, t0 = set(), time.time()
     txn = env.begin(write=True)
     pending = 0
-    with Pool(args.workers, initializer=_init_worker, initargs=(args.hr_lmdb, args.scale, args.fps, args.tsf, args.exposure_space)) as pool:
+    with Pool(args.workers, initializer=_init_worker, initargs=(args.hr_lmdb, args.scale, args.fps, args.tsf, args.exposure_space,
+                                                  args.lmdb_format)) as pool:
         for i, res in enumerate(pool.imap_unordered(_encode_stream, tasks), 1):
             for key, value in zip(res["keys"], res["values"]):
                 txn.put(key.encode("ascii"), value)
-                meta.write(f"{key}.png ({lr_h},{lr_w},3) 0\n")
+                meta.write(f"{key}.png ({lr_h},{lr_w},3) {0 if args.lmdb_format == 'raw' else 1}\n")
                 written.add(key)
             pending += len(res["keys"])
             if pending * per_img > (512 << 20):
@@ -471,6 +487,9 @@ def main() -> None:
     tr.add_argument("--clean-prob", type=float, default=0.15)
     tr.add_argument("--tiers-json", default=None, help="JSON {codec: {tier: [crf_lo, crf_hi]}} overriding the defaults")
     tr.add_argument("--workers", type=int, default=16)
+    tr.add_argument("--lmdb-format", choices=("raw", "png"), default="raw",
+                    help="Output value format: raw (loader raw_lmdb: true) or png (raw_lmdb: false). The HR LMDB "
+                         "is read in either format. Must match the GT LMDB, since raw_lmdb applies to both.")
     tr.add_argument("--max-clips", type=int, default=None, help="Smoke-test on the first N clips")
     tr.add_argument("--exposures", type=int, nargs="+", default=[1],
                     help="Exposure lengths in source frames (odd, <= tsf), sampled per stream; default 1 = no blur. "
