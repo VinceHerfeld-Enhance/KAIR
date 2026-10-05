@@ -41,6 +41,16 @@ Centring keeps the sharp GT at the keyframe index as the mid-exposure frame.
 uses its own RNG stream, so enabling it leaves every codec draw unchanged. In val
 mode, prefix a setting with ``blur<n>+`` (e.g. ``blur5+x264:26``).
 
+Capture + share chain (``--platform-prob``, off by default): real shared video
+(WhatsApp, YouTube) was encoded by the phone at full resolution, then decoded,
+downscaled by the platform's own scaler and re-encoded, sometimes more than once
+(forwarding). A platform stream therefore runs: exposure -> x265 at HR (phone-like,
+``--platform-hr-crf``, fast preset) -> downscale with a random non-MATLAB kernel
+(``--platform-kernels``) -> ``--platform-codecs`` at LR (``--platform-crf``) -> with
+``--platform-reshare-prob`` a second LR encode. It replaces that stream's single-encode
+draw, from its own RNG stream (other draws unchanged). In val mode, e.g.
+``hrx265:20+kbilinear+x264:32[+x264:34]``. VP9's CRF scale (0-63) differs from x264's.
+
 Spatial downscale: MATLAB-faithful antialiased bicubic
 (``vsr.utils.matlab_functions.imresize``), quantised as ``ToPILImage`` does
 (``mul(255).byte()``, i.e. truncation). That is the operator the existing
@@ -90,8 +100,11 @@ from utils.utils_video import RAW_LMDB_MAGIC  # noqa: E402
 try:
     import torch
 
-    from vsr.utils.codec import chain_roundtrip, codec_roundtrip, lossless_check, psnr_uint8
-    from vsr.utils.lr_synthesis import exposure_window, synthesize_lr
+    from vsr.utils.codec import CODECS, chain_roundtrip, codec_roundtrip, lossless_check, psnr_uint8, stream_roundtrip
+    from vsr.utils.lr_synthesis import (
+        DOWNSCALE_KERNELS, downscale_kernel_to_uint8, downscale_to_uint8, exposure_window, integrate_exposure,
+        synthesize_lr, to_float_chw,
+    )
 except ImportError as e:  # pragma: no cover - environment problem, say how to fix it
     raise SystemExit(f"{e}\nRun with the VSR package on the path: PYTHONPATH=<code>/VSR/src") from e
 
@@ -154,6 +167,43 @@ def sample_setting(rng: np.random.Generator, codecs: list[str], tiers: dict, cle
     return {"codec": codec, "tier": tier, "crf": int(rng.integers(lo, hi + 1))}
 
 
+def sample_platform(rng: np.random.Generator, args) -> dict:
+    """Capture + share chain: phone-like HEVC at HR -> platform scaler -> platform encode(s) at LR."""
+    stages = [(args.platform_codecs[rng.integers(len(args.platform_codecs))],
+               int(rng.integers(args.platform_crf[0], args.platform_crf[1] + 1)))]
+    if rng.random() < args.platform_reshare_prob:  # forwarded again: one more, slightly harsher, encode
+        stages.append((stages[0][0], min(51, stages[0][1] + int(rng.integers(0, 4)))))
+    return {
+        "codec": "platform",
+        "hr_codec": "x265", "hr_crf": int(rng.integers(args.platform_hr_crf[0], args.platform_hr_crf[1] + 1)),
+        "hr_preset": "veryfast",  # hardware phone encoders trade efficiency for speed
+        "kernel": args.platform_kernels[rng.integers(len(args.platform_kernels))],
+        "stages": [list(st) for st in stages],
+    }
+
+
+def platform_lr(hr_frames, h: int, w: int, setting: dict, scale: int, fps: float):
+    """Run the platform chain on an iterable of HR uint8 RGB frames.
+
+    Returns ``(degraded LR [T, h/s, w/s, 3], clean MATLAB LR of the same HR frames, kb/s of the last stage)``.
+    The HR-stage stream is round-tripped frame by frame (``stream_roundtrip``), so HR is never held whole.
+    """
+    clean = []
+
+    def feed():
+        for f in hr_frames:
+            clean.append(downscale_to_uint8(to_float_chw(f), scale))
+            yield f
+
+    lr, _ = stream_roundtrip(
+        feed(), h, w, setting["hr_codec"], setting["hr_crf"],
+        on_frame=lambda f: downscale_kernel_to_uint8(to_float_chw(f), scale, setting["kernel"]),
+        preset=setting.get("hr_preset"), fps=fps,
+    )
+    degraded, kbps = chain_roundtrip(np.stack(lr), [tuple(st) for st in setting["stages"]], fps=fps)
+    return degraded, np.stack(clean), kbps
+
+
 def sample_exposure(rng: np.random.Generator, exposures: list[int], weights: list[float] | None) -> int:
     if len(exposures) == 1:
         return exposures[0]
@@ -202,6 +252,18 @@ def _encode_stream(task: dict) -> dict:
     keys, clip_keys, setting, n_exp = task["keys"], task["clip_keys"], task["setting"], task["exposure"]
     first = int(clip_keys[0].split("/")[1])  # clip frames are contiguous (list_clips), so position = idx - first
     blur_psnr = []
+    if setting["codec"] == "platform":
+        with _W["env"].begin() as txn:
+            h, w = _hr_rgb(txn, keys[0]).shape[:2]
+
+            def hr_frames():
+                for k in keys:
+                    window = exposure_window(int(k.split("/")[1]) - first, n_exp, 0, len(clip_keys) - 1)
+                    x = integrate_exposure([_hr_rgb(txn, clip_keys[j]) for j in window], _W["space"])
+                    yield x.clamp(0, 1).mul(255).round().byte().permute(1, 2, 0).numpy()
+
+            degraded, clean, kbps = platform_lr(hr_frames(), h, w, setting, _W["scale"], _W["fps"])
+        return _finish_stream(task, degraded, clean, kbps, blur_psnr)
     with _W["env"].begin() as txn:
         lrs = []
         for k in keys:
@@ -213,6 +275,11 @@ def _encode_stream(task: dict) -> dict:
             lrs.append(lr)
         clean = np.stack(lrs)
     degraded, kbps = apply_setting(clean, setting, _W["fps"])
+    return _finish_stream(task, degraded, clean, kbps, blur_psnr)
+
+
+def _finish_stream(task: dict, degraded: np.ndarray, clean: np.ndarray, kbps: float, blur_psnr: list) -> dict:
+    keys, setting, n_exp = task["keys"], task["setting"], task["exposure"]
     per_frame = [psnr_uint8(d, c) for d, c in zip(degraded, clean)]
     values = [pack_value(np.ascontiguousarray(f[:, :, ::-1]), _W["fmt"]) for f in degraded]  # RGB -> BGR
     record = {
@@ -289,9 +356,13 @@ def build_train(args) -> None:
             rng = np.random.default_rng([args.seed, zlib.crc32(clip.encode()), p])
             # Separate stream for the exposure, so enabling blur leaves the codec draws unchanged.
             rng_exp = np.random.default_rng([args.seed, zlib.crc32(clip.encode()), p, 1])
+            rng_plat = np.random.default_rng([args.seed, zlib.crc32(clip.encode()), p, 2])
+            setting = sample_setting(rng, args.codecs, tiers, args.clean_prob)
+            if args.platform_prob > 0 and rng_plat.random() < args.platform_prob:
+                setting = sample_platform(rng_plat, args)
             tasks.append(
                 {"clip": clip, "phase": p, "keys": stream, "clip_keys": keys,
-                 "setting": sample_setting(rng, args.codecs, tiers, args.clean_prob),
+                 "setting": setting,
                  "exposure": sample_exposure(rng_exp, args.exposures, args.exposure_weights)}
             )
     hr_env.close()
@@ -358,13 +429,30 @@ def summarize(params_path: str) -> None:
 
 # ----------------------------------------------------------------------------- val
 def parse_setting(spec: str) -> dict:
-    """``clean`` | ``[blur<n>+]codec:crf[+codec:crf...]`` | ``blur<n>`` -> setting dict with ``exposure``."""
+    """``clean`` | ``[blur<n>+][hr<codec>:<crf>+k<kernel>+]codec:crf[+codec:crf...]`` -> setting dict.
+
+    ``hr<codec>:<crf>`` (e.g. ``hrx265:20``) encodes at HR before the downscale and ``k<kernel>``
+    (e.g. ``kbilinear``) picks the downscale kernel: together the platform chain, e.g. a
+    WhatsApp-like ``hrx265:20+kbilinear+x264:32`` (phone HEVC -> platform scaler -> H.264).
+    """
     if spec == "clean":
         return {"codec": "none", "exposure": 1}
     parts = spec.split("+")
     exposure = 1
     if parts[0].startswith("blur"):
         exposure = int(parts.pop(0)[4:])
+    hr_stage, kernel = None, None
+    if parts and parts[0].startswith("hr"):
+        c, q = parts.pop(0)[2:].split(":")
+        hr_stage = (c, int(q))
+    if parts and parts[0].startswith("k") and parts[0][1:] in DOWNSCALE_KERNELS:
+        kernel = parts.pop(0)[1:]
+    if hr_stage or kernel:
+        stages = [(st.split(":")[0], int(st.split(":")[1])) for st in parts]
+        if hr_stage is None or not stages:
+            raise SystemExit(f"Platform setting '{spec}' needs hr<codec>:<crf>, then optional k<kernel>, then LR stages")
+        return {"codec": "platform", "hr_codec": hr_stage[0], "hr_crf": hr_stage[1], "hr_preset": "veryfast",
+                "kernel": kernel or "bicubic", "stages": [list(st) for st in stages], "exposure": exposure}
     stages = [(s.split(":")[0], int(s.split(":")[1])) for s in parts]
     if not stages:
         return {"codec": "none", "exposure": exposure}
@@ -435,18 +523,29 @@ def build_val(args) -> None:
                               args.exposure_space)
                 for k in names
             ])
-        cache.clear()
         clean = lr_by_exposure.get(1)
         line = f"{clip}: {len(names)} keyframes"
         for spec in args.settings:
             setting = parse_setting(spec)
-            degraded, kbps = apply_setting(lr_by_exposure[setting["exposure"]], setting, args.fps)
+            if setting["codec"] == "platform":
+                n_exp = setting["exposure"]
+                hr_iter = (
+                    integrate_exposure([hr_frame(j) for j in exposure_window(num_to_pos[_frame_number(k)], n_exp, 0,
+                                                                             len(hr_names) - 1)],
+                                       args.exposure_space).clamp(0, 1).mul(255).round().byte().permute(1, 2, 0).numpy()
+                    for k in names
+                )
+                h0, w0 = hr_frame(num_to_pos[_frame_number(names[0])]).shape[:2]
+                degraded, _, kbps = platform_lr(hr_iter, h0, w0, setting, args.scale, args.fps)
+            else:
+                degraded, kbps = apply_setting(lr_by_exposure[setting["exposure"]], setting, args.fps)
             out_dir = osp.join(args.output_root, f"{args.prefix}_{setting_tag(spec)}", clip)
             os.makedirs(out_dir)
             for frame, name in zip(degraded, names):
                 Image.fromarray(frame).save(osp.join(out_dir, name), compress_level=1)
             if spec != "clean" and clean is not None:
                 line += f" | {spec} {psnr_uint8(degraded, clean):.2f} dB {kbps:.0f} kb/s"
+        cache.clear()
         print(line, flush=True)
     if args.settings:
         print(f"Done. Point the test dataroot_lq at {args.output_root}/{args.prefix}_<setting> (same test_list_dir).")
@@ -491,6 +590,17 @@ def main() -> None:
                     help="Output value format: raw (loader raw_lmdb: true) or png (raw_lmdb: false). The HR LMDB "
                          "is read in either format. Must match the GT LMDB, since raw_lmdb applies to both.")
     tr.add_argument("--max-clips", type=int, default=None, help="Smoke-test on the first N clips")
+    tr.add_argument("--platform-prob", type=float, default=0.0,
+                    help="Fraction of streams drawn from the capture+share chain instead of a single LR encode "
+                         "(default 0 = off): phone HEVC at HR -> platform downscale kernel -> platform encode(s)")
+    tr.add_argument("--platform-hr-crf", type=int, nargs=2, default=[18, 24], help="Phone-stage x265 CRF range at HR")
+    tr.add_argument("--platform-kernels", nargs="+", default=["bicubic", "bilinear", "area", "lanczos"],
+                    choices=DOWNSCALE_KERNELS, help="Platform scaler kernels, sampled uniformly")
+    tr.add_argument("--platform-codecs", nargs="+", default=["x264"], choices=sorted(CODECS),
+                    help="Platform-stage codecs at LR (WhatsApp: x264; YouTube: x264/vp9)")
+    tr.add_argument("--platform-crf", type=int, nargs=2, default=[28, 36], help="Platform-stage CRF range at LR")
+    tr.add_argument("--platform-reshare-prob", type=float, default=0.3,
+                    help="Probability of a second platform encode (a forwarded video)")
     tr.add_argument("--exposures", type=int, nargs="+", default=[1],
                     help="Exposure lengths in source frames (odd, <= tsf), sampled per stream; default 1 = no blur. "
                          "E.g. 1 3 5 7 = 45/135/225/315 deg shutter at 30 fps from 240 fps")

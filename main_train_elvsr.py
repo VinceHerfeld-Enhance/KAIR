@@ -268,7 +268,7 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
 
     if is_main:
         wandb.init(
-            project="KAIR_VideoSR",
+            project=opt.get("wandb_project", "KAIR_VideoSR"),
             name=opt["task"] if "task" in opt else "run",
             config=opt,
         )
