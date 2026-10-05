@@ -352,7 +352,9 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     # ----------------------------------------
     """
 
-    test_loader = None
+    # One loader per ``test`` / ``test_<name>`` dataset key, e.g. test_clean, test_mild,
+    # test_whatsapp: each is validated and logged separately (see _run_validation).
+    test_loaders = OrderedDict()
     runtime_opt = opt.get("train", {}).get("runtime", {})
 
     for phase, dataset_opt in opt["datasets"].items():
@@ -378,10 +380,15 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
                     f"{round(dataset_opt['lq_patch'] * sampler.scale_hi)}]"
                 )
 
-        elif phase == "test":
+        elif phase.split("_")[0] == "test":
             test_set = define_Dataset(dataset_opt)
+            if len(test_set) == 0:
+                raise FileNotFoundError(
+                    f"Validation set '{phase}' is empty: check dataroot_lq={dataset_opt['dataroot_lq']} "
+                    f"and dataroot_gt={dataset_opt['dataroot_gt']}"
+                )
             test_loader_kwargs = _build_dataloader_kwargs(dataset_opt, runtime_opt, phase="test")
-            test_loader = DataLoader(test_set, **test_loader_kwargs)
+            test_loaders[phase] = DataLoader(test_set, **test_loader_kwargs)
         else:
             raise NotImplementedError("Phase [%s] is not recognized." % phase)
 
@@ -414,7 +421,7 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
     # Step--4 (main training)
     # ----------------------------------------
     """
-    saved_fixed = False  # avoid saving the same fixed test frames multiple times
+    saved_fixed = {key: False for key in test_loaders}  # save each set's fixed L/H debug frames once
     total_iter = opt["train"]["total_iter"]
     epoch = 0
 
@@ -592,9 +599,9 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
             # 6) testing (only on main process)
             # -------------------------------
             if current_step % opt["train"]["checkpoint_test"] == 0 and is_main:
-                if test_loader is not None:
-                    saved_fixed = _run_validation(
-                        model, test_loader, opt, logger, epoch, current_step, tsf, saved_fixed
+                for test_key, test_loader in test_loaders.items():
+                    saved_fixed[test_key] = _run_validation(
+                        model, test_loader, test_key, opt, logger, epoch, current_step, tsf, saved_fixed[test_key]
                     )
 
             body_end = time.perf_counter()
@@ -681,16 +688,22 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/elvsr/feature_v1.json")
         model.save(current_step)
 
         # Final validation at last iteration
-        if test_loader is not None:
-            _run_validation(model, test_loader, opt, logger, epoch, current_step, tsf, saved_fixed)
+        for test_key, test_loader in test_loaders.items():
+            _run_validation(model, test_loader, test_key, opt, logger, epoch, current_step, tsf, saved_fixed[test_key])
 
         wandb.finish()
     accelerator.wait_for_everyone()
     sys.exit()
 
 
-def _run_validation(model, test_loader, opt, logger, epoch, current_step, tsf, saved_fixed):
-    """Run validation loop, compute metrics, log to wandb. Returns updated saved_fixed."""
+def _run_validation(model, test_loader, test_key, opt, logger, epoch, current_step, tsf, saved_fixed):
+    """Run validation loop on one test set, compute metrics, log to wandb. Returns updated saved_fixed.
+
+    ``test_key`` is the ``datasets`` key: plain ``test`` logs ``val/PSNR`` (as before),
+    ``test_<name>`` logs ``val/<name>/PSNR``.
+    """
+    set_name = test_key.split("_", 1)[1] if "_" in test_key else ""
+    log_prefix = f"val/{set_name}/" if set_name else "val/"
 
     # SSIM is deliberately not computed here. PSNR-Y is the only training-time signal
     # used to steer a run; every other metric (SSIM, temporal consistency, ...) is
@@ -702,7 +715,7 @@ def _run_validation(model, test_loader, opt, logger, epoch, current_step, tsf, s
     test_results["psnr"] = []
     test_results["psnr_y"] = []
 
-    test_list_dir = opt["datasets"]["test"].get("test_list_dir", None) if opt["datasets"]["test"] else None
+    test_list_dir = opt["datasets"][test_key].get("test_list_dir", None)
 
     for idx, test_data in enumerate(test_loader):
         folder = test_data["folder"]
@@ -731,7 +744,9 @@ def _run_validation(model, test_loader, opt, logger, epoch, current_step, tsf, s
         # debug: save L / E / H frames for one test video
         # -------------------------------
         if opt["val"]["checkpoint_debug_frames"]:
-            debug_val_dir = os.path.join(opt["path"]["images"], "debug_val", f"iter_{current_step:08d}", folder[0])
+            debug_val_dir = os.path.join(
+                opt["path"]["images"], "debug_val", f"iter_{current_step:08d}", set_name, folder[0]
+            )
             lr_frames = visuals["L"]  # [T_lq, C, H, W]
 
             modalities = [("E", output)]
@@ -798,28 +813,28 @@ def _run_validation(model, test_loader, opt, logger, epoch, current_step, tsf, s
             psnr_y = sum(test_results_folder["psnr_y"]) / len(test_results_folder["psnr_y"])
 
             logger.info(
-                "Testing {:20s} ({:2d}/{}) - PSNR: {:.2f} dB; PSNR_Y: {:.2f} dB".format(
-                    folder[0], idx, len(test_loader), psnr, psnr_y
+                "Testing {}{:20s} ({:2d}/{}) - PSNR: {:.2f} dB; PSNR_Y: {:.2f} dB".format(
+                    f"[{set_name}] " if set_name else "", folder[0], idx, len(test_loader), psnr, psnr_y
                 )
             )
             test_results["psnr"].append(psnr)
             test_results["psnr_y"].append(psnr_y)
         else:
-            logger.info("Testing {:20s}  ({:2d}/{})".format(folder[0], idx, len(test_loader)))
+            logger.info("Testing {}{:20s}  ({:2d}/{})".format(f"[{set_name}] " if set_name else "", folder[0], idx, len(test_loader)))
 
     # summarize psnr
     if len(test_results["psnr"]) > 0:
         ave_psnr = sum(test_results["psnr"]) / len(test_results["psnr"])
         ave_psnr_y = sum(test_results["psnr_y"]) / len(test_results["psnr_y"])
         logger.info(
-            "<epoch:{:3d}, iter:{:8,d} Average PSNR: {:.2f} dB; PSNR_Y: {:.2f} dB".format(
-                epoch, current_step, ave_psnr, ave_psnr_y
+            "<epoch:{:3d}, iter:{:8,d} {}Average PSNR: {:.2f} dB; PSNR_Y: {:.2f} dB".format(
+                epoch, current_step, f"[{set_name}] " if set_name else "", ave_psnr, ave_psnr_y
             )
         )
         wandb.log(
             {
-                "val/PSNR": ave_psnr,
-                "val/PSNR_Y": ave_psnr_y,
+                f"{log_prefix}PSNR": ave_psnr,
+                f"{log_prefix}PSNR_Y": ave_psnr_y,
             },
             step=current_step,
         )
