@@ -387,6 +387,9 @@ def define_G(opt):
             # (batch 1), ~4.7x the per-call footprint of a training chunk at the same
             # k, so a training value of -1 OOMs at the first checkpoint_test.
             decode_chunk_eval=opt_net.get("decode_chunk_eval", None),
+            # Rebuttal ablations (E1 / E4); defaults leave the flagship unchanged.
+            fusion_strategy=opt_net.get("fusion_strategy", "direct"),
+            trajectory_override=opt_net.get("trajectory_override", None),
         )
     elif net_type == "bfstvsr":
         # BF-STVSR (CVPR 2025) trained from scratch inside KAIR. Built via the VSR
