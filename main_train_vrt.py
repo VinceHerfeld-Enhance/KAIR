@@ -51,14 +51,16 @@ def main(json_path="/home/vherfeld/Research/KAIR/options/rvrt/001_train_rvrt_vid
     if opt["dist"]:
         init_dist("pytorch")
     opt["rank"], opt["world_size"] = get_dist_info()
-    # assign GPU to each distributed process
+    # assign GPU to each distributed process (torchrun passes LOCAL_RANK in the env, not as --local-rank)
     if opt["dist"]:
-        torch.cuda.set_device(parser.parse_args().local_rank)
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", parser.parse_args().local_rank)))
     if opt["rank"] == 0:
         util.mkdirs((path for key, path in opt["path"].items() if "pretrained" not in key))
 
     if opt["rank"] == 0:
-        wandb.init(project="KAIR_VideoSR", name=opt["task"] if "task" in opt else "run", config=opt)
+        wandb.init(
+            project=opt.get("wandb_project", "KAIR_VideoSR"), name=opt["task"] if "task" in opt else "run", config=opt
+        )
     # ----------------------------------------
     # update opt
     # ----------------------------------------

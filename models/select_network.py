@@ -291,6 +291,28 @@ def define_G(opt):
         )
 
     # ----------------------------------------
+    # BasicVSR++ 2-vs-4-branch study (VSR/src/vsr/research_models/basicvsrpp_ablation.py)
+    # ----------------------------------------
+    elif net_type == "basicvsrpp_abl":
+        from vsr.research_models.basicvsrpp_ablation import DEFAULT_BRANCHES, BasicVSRPPAblation
+
+        netG = BasicVSRPPAblation(
+            mid_channels=opt_net.get("mid_channels", 64),
+            num_blocks=opt_net.get("num_blocks", 7),
+            max_residue_magnitude=opt_net.get("max_residue_magnitude", 10),
+            spynet_path=opt_net.get("spynet_path", None),
+            cpu_cache_length=opt_net.get("cpu_cache_length", 100),
+            branches=opt_net.get("branches", list(DEFAULT_BRANCHES)),
+            align=opt_net.get("align", "bilinear"),
+            snap_grad=opt_net.get("snap_grad", "mask_only"),
+            snap_posenc_freqs=opt_net.get("snap_posenc_freqs", 2),
+            snap_frac_hidden=opt_net.get("snap_frac_hidden", 16),
+            flow_refine=opt_net.get("flow_refine", "none"),
+            flow_refine_hidden=opt_net.get("flow_refine_hidden", 32),
+            head_input=opt_net.get("head_input", "all"),
+        )
+
+    # ----------------------------------------
     # others
     # ----------------------------------------
     elif net_type == "stvsr":

@@ -1,0 +1,119 @@
+{
+  "task": "bvpp_abl_A3_3branch",
+  "model": "vrt",
+  "gpu_ids": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "dist": true,
+  "find_unused_parameters": false,
+  "use_static_graph": true,
+  "wandb_project": "BasicVSRpp_2branch",
+  "scale": 4,
+  "n_channels": 3,
+  "path": {
+    "root": "experiments/basicvsrpp_abl",
+    "pretrained_netG": null,
+    "pretrained_netE": null
+  },
+  "datasets": {
+    "train": {
+      "name": "train_dataset",
+      "dataset_type": "VideoRecurrentTrainDataset",
+      "dataroot_gt": "trainsets/REDS/train_sharp_with_val.lmdb",
+      "dataroot_lq": "trainsets/REDS/train_sharp_bicubic_with_val.lmdb",
+      "meta_info_file": "data/meta_info/meta_info_REDS_GT.txt",
+      "filename_tmpl": "08d",
+      "filename_ext": "png",
+      "val_partition": "REDS4",
+      "test_mode": false,
+      "io_backend": {
+        "type": "lmdb"
+      },
+      "num_frame": 30,
+      "gt_size": 256,
+      "interval_list": [
+        1
+      ],
+      "random_reverse": false,
+      "use_hflip": true,
+      "use_rot": true,
+      "dataloader_shuffle": true,
+      "dataloader_num_workers": 16,
+      "dataloader_batch_size": 8
+    },
+    "test": {
+      "name": "test_dataset",
+      "dataset_type": "VideoRecurrentTestDataset",
+      "dataroot_gt": "testsets/REDS4/GT",
+      "dataroot_lq": "testsets/REDS4/sharp_bicubic",
+      "cache_data": true,
+      "io_backend": {
+        "type": "disk"
+      },
+      "num_frame": -1
+    }
+  },
+  "netG": {
+    "net_type": "basicvsrpp_abl",
+    "mid_channels": 64,
+    "num_blocks": 7,
+    "max_residue_magnitude": 10,
+    "spynet_path": "model_zoo/basicvsrpp/spynet_sintel_final-3d2a1287.pth",
+    "cpu_cache_length": 100,
+    "branches": [
+      "backward_1",
+      "forward_1",
+      "backward_2"
+    ],
+    "align": "bilinear",
+    "snap_grad": "mask_only",
+    "flow_refine": "none",
+    "head_input": "all",
+    "init_type": "default",
+    "init_bn_type": "uniform",
+    "init_gain": 0.2
+  },
+  "train": {
+    "G_lossfn_type": "charbonnier",
+    "G_lossfn_weight": 1.0,
+    "G_charbonnier_eps": 1e-12,
+    "E_decay": 0,
+    "G_optimizer_type": "adam",
+    "G_optimizer_lr": 0.0001,
+    "G_optimizer_betas": [
+      0.9,
+      0.99
+    ],
+    "G_optimizer_wd": 0,
+    "G_optimizer_clipgrad": null,
+    "G_optimizer_reuse": true,
+    "fix_iter": 5000,
+    "fix_lr_mul": 0.25,
+    "fix_keys": [
+      "spynet"
+    ],
+    "total_iter": 150000,
+    "G_scheduler_type": "CosineAnnealingWarmRestarts",
+    "G_scheduler_periods": 150000,
+    "G_scheduler_eta_min": 1e-07,
+    "G_regularizer_orthstep": null,
+    "G_regularizer_clipstep": null,
+    "G_param_strict": true,
+    "E_param_strict": true,
+    "checkpoint_test": 10000,
+    "checkpoint_save": 10000,
+    "checkpoint_print": 200
+  },
+  "val": {
+    "save_img": false,
+    "pad_seq": false,
+    "flip_seq": false,
+    "center_frame_only": false,
+    "num_frame_testing": 0,
+    "num_frame_overlapping": 2,
+    "size_patch_testing": 0
+  }
+}
