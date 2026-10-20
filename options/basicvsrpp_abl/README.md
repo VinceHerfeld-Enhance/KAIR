@@ -26,7 +26,7 @@ regenerate; don't hand-edit the JSONs).
 | `B1_snap_window` | b1 f1 | snap, `max_residue_magnitude` 0 | IART-style local window vs multi-location gather |
 | `B1_snap_ste` | b1 f1 | snap, straight-through grads | gradient mode alternative |
 | `B2_rqfp_spynet` | b1 f1 | RQFP as SpyNet warm start | fast-motion SpyNet failures |
-| `B2_learned` | b1 f1 | RQFP + learned flow residual | is learning needed beyond the closed form? |
+| `B2_learned` | b1 f1 | RQFP + learned residual (flows + photometric evidence) | does image evidence beat the closed form? |
 | `pilot_snap_mask_only`, `pilot_snap_ste` | b1 f1 | snap, 20k iters | do snapped offsets learn at all? |
 
 Options in brief:
@@ -38,9 +38,16 @@ Options in brief:
   window arm every tap shares one fraction. In `mask_only` mode the loss reaches the offsets only
   through that fraction, as in IART. In `ste` mode the fetch also gets a straight-through
   bilinear gradient.
-- **RQFP.** A least-squares fit of `f_k = v·k + a·k²/2` over the ±1/±2 neighbours, re-evaluated
-  at k = ±1. It has no parameters. Plain QVI (2 observations) would return the input flow
-  unchanged.
+- **RQFP** (`flow_fit: "midpoint"`, the default). Each pair's flow becomes the least-squares
+  slope, at the pair's midpoint, of a quadratic (constant-acceleration) trajectory through frames
+  t−1..t+2, followed along the pixel by flow composition. It has no parameters, and its weights are
+  symmetric: 0.4 on the pair's own SpyNet flow and 0.3 on each neighbouring pair. `"anchor"` is the
+  QVI/EQVI form anchored at frame t; it leans forward (0.45 own / 0.32 next / 0.23 previous). Plain
+  QVI (2 observations) would return the input flow unchanged.
+- **Learned refiner** (`B2_learned`). A zero-initialised CNN residual on top of RQFP. It sees the
+  four multi-frame flow observations **and image evidence**: each observation's photometric warp
+  error plus the anchor frame. That evidence is what lets it tell a real acceleration change from
+  a SpyNet failure, which the flows-only closed form smooths indiscriminately.
 
 Cost per frame at 180×320 (`VSR/scripts/count_basicvsrpp_ablation_cost.py`): 1 round 561 GFLOPs,
 2 rounds 830, snap +5, rqfp +0, rqfp_spynet +64. Round 2 is 32% of the FLOPs but half the

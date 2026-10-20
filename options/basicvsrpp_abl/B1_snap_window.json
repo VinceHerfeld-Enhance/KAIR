@@ -70,6 +70,7 @@
     "align": "snap",
     "snap_grad": "mask_only",
     "flow_refine": "none",
+    "flow_fit": "midpoint",
     "head_input": "all",
     "init_type": "default",
     "init_bn_type": "uniform",

@@ -71,6 +71,7 @@ BASE = {
         "align": "bilinear",
         "snap_grad": "mask_only",
         "flow_refine": "none",
+        "flow_fit": "midpoint",
         "head_input": "all",
         "init_type": "default",  # keep basicsr inits (zero offset heads, pretrained SpyNet)
         "init_bn_type": "uniform",

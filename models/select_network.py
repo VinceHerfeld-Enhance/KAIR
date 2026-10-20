@@ -308,6 +308,7 @@ def define_G(opt):
             snap_posenc_freqs=opt_net.get("snap_posenc_freqs", 2),
             snap_frac_hidden=opt_net.get("snap_frac_hidden", 16),
             flow_refine=opt_net.get("flow_refine", "none"),
+            flow_fit=opt_net.get("flow_fit", "midpoint"),
             flow_refine_hidden=opt_net.get("flow_refine_hidden", 32),
             head_input=opt_net.get("head_input", "all"),
         )
