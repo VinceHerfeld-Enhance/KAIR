@@ -131,7 +131,7 @@ ARMS = {
     # vs B1_snap isolates "local window" from "multi-location gather" (Chan et al. AAAI'21 offset diversity).
     "B1_snap_window": {"branches": ONE_ROUND, "align": "snap", "max_residue_magnitude": 0},
     "B2_rqfp_spynet": {"branches": ONE_ROUND, "flow_refine": "rqfp_spynet"},
-    "B2_rqfp_learned": {"branches": ONE_ROUND, "flow_refine": "rqfp_learned"},
+    "B2_learned": {"branches": ONE_ROUND, "flow_refine": "learned"},
 }
 
 # Short runs to check that snapped offsets still learn before committing the full B1/B3 runs.

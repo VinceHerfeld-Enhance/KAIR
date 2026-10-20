@@ -26,7 +26,7 @@ regenerate; don't hand-edit the JSONs).
 | `B1_snap_window` | b1 f1 | snap, `max_residue_magnitude` 0 | IART-style local window vs multi-location gather |
 | `B1_snap_ste` | b1 f1 | snap, straight-through grads | gradient mode alternative |
 | `B2_rqfp_spynet` | b1 f1 | RQFP as SpyNet warm start | fast-motion SpyNet failures |
-| `B2_rqfp_learned` | b1 f1 | midpoint fit + learned residual (same 3 inputs) | is the closed form leaving anything on the table? |
+| `B2_learned` | b1 f1 | pairwise flow + learned residual (3 trajectory observations) | does a learned multi-frame correction beat the closed form? |
 | `pilot_snap_mask_only`, `pilot_snap_ste` | b1 f1 | snap, 20k iters | do snapped offsets learn at all? |
 
 Options in brief:
@@ -44,10 +44,12 @@ Options in brief:
   symmetric: 0.4 on the pair's own SpyNet flow and 0.3 on each neighbouring pair. `"anchor"` is the
   QVI/EQVI form anchored at frame t; it leans forward (0.45 own / 0.32 next / 0.23 previous). Plain
   QVI (2 observations) would return the input flow unchanged.
-- **Learned fit residual** (`B2_rqfp_learned`). A two-layer CNN (6 → 16 → 2) adds a
-  zero-initialised correction to the midpoint fit. Its only inputs are the fit's own three
-  trajectory observations, so it starts as the closed form and learns only what the closed form
-  misses. One network serves both directions. Clip ends keep the closed form. Image evidence was
+- **Learned residual** (`B2_learned`). The pairwise SpyNet flow plus a zero-initialised residual
+  from a two-layer CNN (6 → 16 → 2), with no closed-form base. This is the same pattern as
+  STVSRNet's B-spline head (linear flow + residual), but the residual is **not** centred: every
+  query here is a whole frame, so a centred residual would change nothing. The only inputs are the
+  pair's three trajectory observations (frames t−1, t+1, t+2), so it starts exactly at A. One
+  network serves both directions, and clip ends keep the pairwise flow. Image evidence was
   deliberately left out; add it only if this arm shows the flows alone aren't enough.
 
 Cost per frame at 180×320 (`VSR/scripts/count_basicvsrpp_ablation_cost.py`): 1 round 561 GFLOPs,
@@ -81,7 +83,7 @@ bash scripts/abaca/submit.sh pilot_snap_mask_only pilot_snap_ste           # 1. 
 bash scripts/abaca/submit.sh A_1round C_2round A5_1round_deep \
                              B1_snap B2_rqfp B3_snap_rqfp                   # 2. tier 1
 bash scripts/abaca/submit.sh A3_3branch D_2round_snap B1_snap_window \
-                             B1_snap_ste B2_rqfp_spynet B2_rqfp_learned          # 3. tier 2, as budget allows
+                             B1_snap_ste B2_rqfp_spynet B2_learned          # 3. tier 2, as budget allows
 ```
 
 Defaults: 4 GPUs per job (batch 8 total = 2 per GPU), 48 h walltime, 150k iterations.
