@@ -1,5 +1,5 @@
 {
-  "task": "bvpp_abl_B2_learned",
+  "task": "bvpp_abl_B2_rqfp_learned",
   "model": "vrt",
   "gpu_ids": [
     0,
@@ -69,7 +69,7 @@
     ],
     "align": "bilinear",
     "snap_grad": "mask_only",
-    "flow_refine": "learned",
+    "flow_refine": "rqfp_learned",
     "flow_fit": "midpoint",
     "head_input": "all",
     "init_type": "default",

@@ -26,7 +26,7 @@ regenerate; don't hand-edit the JSONs).
 | `B1_snap_window` | b1 f1 | snap, `max_residue_magnitude` 0 | IART-style local window vs multi-location gather |
 | `B1_snap_ste` | b1 f1 | snap, straight-through grads | gradient mode alternative |
 | `B2_rqfp_spynet` | b1 f1 | RQFP as SpyNet warm start | fast-motion SpyNet failures |
-| `B2_learned` | b1 f1 | RQFP + learned residual (flows + photometric evidence) | does image evidence beat the closed form? |
+| `B2_rqfp_learned` | b1 f1 | midpoint fit + learned residual (same 3 inputs) | is the closed form leaving anything on the table? |
 | `pilot_snap_mask_only`, `pilot_snap_ste` | b1 f1 | snap, 20k iters | do snapped offsets learn at all? |
 
 Options in brief:
@@ -44,10 +44,11 @@ Options in brief:
   symmetric: 0.4 on the pair's own SpyNet flow and 0.3 on each neighbouring pair. `"anchor"` is the
   QVI/EQVI form anchored at frame t; it leans forward (0.45 own / 0.32 next / 0.23 previous). Plain
   QVI (2 observations) would return the input flow unchanged.
-- **Learned refiner** (`B2_learned`). A zero-initialised CNN residual on top of RQFP. It sees the
-  four multi-frame flow observations **and image evidence**: each observation's photometric warp
-  error plus the anchor frame. That evidence is what lets it tell a real acceleration change from
-  a SpyNet failure, which the flows-only closed form smooths indiscriminately.
+- **Learned fit residual** (`B2_rqfp_learned`). A two-layer CNN (6 → 16 → 2) adds a
+  zero-initialised correction to the midpoint fit. Its only inputs are the fit's own three
+  trajectory observations, so it starts as the closed form and learns only what the closed form
+  misses. One network serves both directions. Clip ends keep the closed form. Image evidence was
+  deliberately left out; add it only if this arm shows the flows alone aren't enough.
 
 Cost per frame at 180×320 (`VSR/scripts/count_basicvsrpp_ablation_cost.py`): 1 round 561 GFLOPs,
 2 rounds 830, snap +5, rqfp +0, rqfp_spynet +64. Round 2 is 32% of the FLOPs but half the
@@ -80,7 +81,7 @@ bash scripts/abaca/submit.sh pilot_snap_mask_only pilot_snap_ste           # 1. 
 bash scripts/abaca/submit.sh A_1round C_2round A5_1round_deep \
                              B1_snap B2_rqfp B3_snap_rqfp                   # 2. tier 1
 bash scripts/abaca/submit.sh A3_3branch D_2round_snap B1_snap_window \
-                             B1_snap_ste B2_rqfp_spynet B2_learned          # 3. tier 2, as budget allows
+                             B1_snap_ste B2_rqfp_spynet B2_rqfp_learned          # 3. tier 2, as budget allows
 ```
 
 Defaults: 4 GPUs per job (batch 8 total = 2 per GPU), 48 h walltime, 150k iterations.
