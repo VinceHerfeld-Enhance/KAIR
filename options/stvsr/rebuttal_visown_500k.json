@@ -145,14 +145,15 @@
     "decoupled_z_head": false,
     "vis_traj_shared_coefficients": false,
     "traj_direct_coefficients": true,
-    "vis_direct_coefficients": false,
+    "vis_direct_coefficients": true,
     "flow_scale_enabled": false,
     "use_occ_cue": true,
     "vis_splat_evidence": false,
     "vis_head_n_freqs": 3,
     "init_type": "default",
     "init_bn_type": "uniform",
-    "init_gain": 1.0
+    "init_gain": 1.0,
+    "vis_basis": "bspline"
   },
   "train": {
     "teacher_flow_p0": 1.0,
